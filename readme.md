@@ -43,7 +43,7 @@ python main_script.py --dir /path/to/your/data --start 2001 --end 2003 --process
 - `--stage`: Start from specific stage (1-5, 0 for all stages)
 - `--processes`: Number of processes to use (default: all available cores)
 - `--sequential`: Use sequential processing instead of multiprocessing
-- `--force`: Force recomputation of all steps even if outputs exist
+
 
 ### Running Only the Similarity Calculation Stage
 

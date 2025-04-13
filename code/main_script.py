@@ -37,7 +37,7 @@ def run_stage1(main_dir):
     f_vocabulary = os.path.join(main_dir, "vocabulary_raw.txt")
     
     if all(os.path.exists(f) and os.path.getsize(f) > 0 for f in [f_terms, f_years, f_patents_idxs, f_vocabulary]):
-        print("Stage 2 output file already exists，skipping...")
+        print("Stage 1 output file already exists, skipping...")
         return True
     
     ppd = Stage01PreprocessData()
@@ -74,7 +74,7 @@ def run_stage2(main_dir):
     f_patents_idxs = os.path.join(main_dir, "patents_idxs.txt")
     
     if all(os.path.exists(f) and os.path.getsize(f) > 0 for f in [f_vocabulary, f_patents_idxs]):
-        print("Stage 2 output file already exists，skipping...")
+        print("Stage 2 output file already exists, skipping...")
         return True
     
     cip = Stage02CodifyIdxPatents()
@@ -166,7 +166,7 @@ def run_stage4(main_dir):
     years_dir = os.path.join(main_dir, "years")
     
     if os.path.exists(years_dir) and os.path.isdir(years_dir) and len(os.listdir(years_dir)) > 0:
-        print("Stage 4 output file already exists，skipping...")
+        print("Stage 4 output file already exists, skipping...")
         return True
     
     sdpy = Stage04SplitDataPerYear()
@@ -273,7 +273,6 @@ def main():
     parser.add_argument('--stage', type=int, default=0, help='Start from specific stage (1-5, 0 for all stages)')
     parser.add_argument('--processes', type=int, default=None, help='Number of processes to use for multiprocessing (default: all available cores)')
     parser.add_argument('--sequential', action='store_true', help='Use sequential processing instead of multiprocessing')
-    parser.add_argument('--force', action='store_true', help='Force recomputation of all steps even if outputs exist')
     args = parser.parse_args()
     
     main_dir = args.dir
@@ -282,38 +281,11 @@ def main():
     start_stage = args.stage
     num_processes = args.processes
     sequential = args.sequential
-    force_recompute = args.force
     
     # Create main directory if it doesn't exist
     ensure_dir_exists(main_dir)
     
     start_time = time.time()
-    
-    # If the --force parameter is specified, all existing output files are deleted (optional)）
-    if force_recompute:
-        print("Forced recalculation of all steps...")
-        # Delete the output files for Stages 1-4
-        if start_stage <= 1:
-            files_to_remove = [
-                os.path.join(main_dir, "patents_terms.txt"),
-                os.path.join(main_dir, "patents_years.txt"),
-                os.path.join(main_dir, "patents_numbers.txt"),
-                os.path.join(main_dir, "vocabulary_raw.txt")
-            ]
-            for file in files_to_remove:
-                if os.path.exists(file):
-                    os.remove(file)
-                    print(f"Deleted {file}")
-        
-        # Deleting Stage 5 output files
-        if start_stage <= 5:
-            jaccard_dir = os.path.join(main_dir, "jaccard")
-            if os.path.exists(jaccard_dir):
-                for year in range(start_year, end_year + 1):
-                    jaccard_file = os.path.join(jaccard_dir, f"jaccard_{year}.txt")
-                    if os.path.exists(jaccard_file):
-                        os.remove(jaccard_file)
-                        print(f"Deleted {jaccard_file}")
     
     # Run all stages or from a specific stage
     if start_stage <= 1:
