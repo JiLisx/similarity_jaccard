@@ -2,6 +2,8 @@
 
 This is an enhanced version of the patent similarity analysis system with multiprocessing support for significantly improved performance on multi-core systems.
 
+This codebase includes a Java-to-Python translation of the implementation referenced in Arts, S., Cassiman, B., & Gomez, J.C. (2017), along with additional functional improvements.
+
 ## Overview
 
 The system processes patent data through several stages:
