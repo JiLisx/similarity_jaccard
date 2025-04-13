@@ -37,7 +37,7 @@ class Stage04SplitDataPerYear:
                 year_patent = al_years[n_patent]
                 year_pat = int(year_patent)
                 
-                if 1900 <= year_pat <= 2016:  # Check the maximum year of the data
+                if 1900 <= year_pat <= 2025:  # Check the maximum year of the data
                     if year_patent not in years:
                         f_year = os.path.join(years_dir, f"patents_indexed_{year_patent}.txt")
                         years[year_patent] = open(f_year, 'w', encoding='utf-8')
