@@ -1,15 +1,15 @@
 """
 # Date: Created on Apr 12, 2025 
-# Author: Ji Li (Modified with multiprocessing support)
+# Author: Ji Li (Modified with optimized multiprocessing support)
 
 @cite Arts, S., Cassiman, B., & Gomez, J. C. (2017). Text matching to measure patent similarity. Strategic Management Journal.
 
-Compute pair-wise Jaccard similarity between patents in the same year with multiprocessing support.
+Compute pair-wise Jaccard similarity between patents in the same year with optimized multiprocessing support.
+Compatible with Python 3.6+
 """
 import os
 import time
 import multiprocessing as mp
-from collections import OrderedDict, defaultdict
 from functools import partial
 
 class Stage05ComputeSimilarity:
@@ -57,7 +57,7 @@ class Stage05ComputeSimilarity:
             for line in br_content:
                 line_split = line.strip().split(' ')
                 id_patent = line_split[0]
-                patent = OrderedDict()
+                patent = {}
                 
                 for i in range(2, len(line_split)):
                     elements = line_split[i].split(':')
@@ -66,10 +66,7 @@ class Stage05ComputeSimilarity:
                     
                     patent[token] = tf_token
                     
-                    if token not in inverted_index:
-                        inverted_index[token] = []
-                    
-                    inverted_index[token].append(id_patent)
+                    inverted_index.setdefault(token, []).append(id_patent)
                 
                 patents[id_patent] = patent
                 n_patent += 1
@@ -77,75 +74,62 @@ class Stage05ComputeSimilarity:
                 if n_patent % 10000 == 0:  # Outputs the progress of this process
                     print(f"\t{n_patent} patents read...")
     
-    def process_patents(self, patent_a, values, patents, inverted_index, previous_patents):
+    def process_patent_batch(self, batch_data):
         """
-        Computes the number of keywords shared by two patents (intersection).
-        It uses the inverted index to compute the intersection for all the patents related with
-        a focus patent (patent A). It stores the intersections in a map.
-        Since the similarities are computed pair-wise and the similarity between A and B
-        is the same as between B and A, it stores a map of previous patents
-        for which the similarity was already computed.
+        Process a batch of patents to find similarities
         
         Args:
-            patent_a: The focus patent.
-            values: The map to store all the intersections.
-            patents: The patent data.
-            inverted_index: The inverted index of keywords and their associated patent numbers.
-            previous_patents: The map of previous patents.
-        """
-        for idx in patent_a:
-            for idx_patent in inverted_index.get(idx, []):
-                if idx_patent not in previous_patents:
-                    if idx_patent not in values:
-                        values[idx_patent] = 0
-                    values[idx_patent] += 1
-    
-    def calculate_similarities_for_patent(self, args):
-        """
-        Calculate Jaccard similarities for a single patent against other patents.
-        This function is designed to be used with multiprocessing.
-        
-        Args:
-            args: Tuple containing (idx_patent_a, patent_a, num_kw_patent_a, patents, 
-                                   inverted_index, previous_patents, lhm_patents_idx)
-        
+            batch_data: Tuple containing (patent_ids, batch_start, batch_end, patents, inverted_index)
+            
         Returns:
             List of similarity tuples (patent_a, patent_b, similarity)
         """
-        idx_patent_a, patent_a, num_kw_patent_a, patents, inverted_index, previous_patents, lhm_patents_idx = args
+        patent_ids, batch_start, batch_end, patents, token_to_patents = batch_data
         
-        values = {}
         results = []
         
-        # Process this patent against all others not in previous_patents
-        for idx in patent_a:
-            for idx_patent in inverted_index.get(idx, []):
-                if idx_patent not in previous_patents:
-                    if idx_patent not in values:
-                        values[idx_patent] = 0
-                    values[idx_patent] += 1
-        
-        # Calculate similarity for each patent pair
-        for idx_patent_b, intersection in values.items():
-            if idx_patent_b not in previous_patents:
-                patent_b = patents[idx_patent_b]
-                num_kw_patent_b = len(patent_b)
+        # For each patent in this batch
+        for i in range(batch_start, batch_end):
+            patent_id_a = patent_ids[i]
+            patent_a = patents[patent_id_a]
+            num_tokens_a = len(patent_a)
+            
+            # Find candidates that share at least one token
+            candidates = set()
+            for token in patent_a:
+                if token in token_to_patents:
+                    for pid in token_to_patents[token]:
+                        # Only process patents with higher indices to avoid duplicates
+                        if patent_ids.index(pid) > i:
+                            candidates.add(pid)
+            
+            # Calculate similarity for each candidate
+            for patent_id_b in candidates:
+                patent_b = patents[patent_id_b]
+                num_tokens_b = len(patent_b)
                 
-                union = (num_kw_patent_a + num_kw_patent_b) - intersection
-                jaccard_similarity = intersection / union
+                # Calculate intersection (tokens in both patent_a and patent_b)
+                intersection = 0
+                for token in patent_a:
+                    if token in patent_b:
+                        intersection += 1
                 
-                # Round to 6 digits
-                round_sim = int(jaccard_similarity * 100000)
-                jaccard_similarity = round_sim / 100000.0
-                
-                if jaccard_similarity > 0:  # Outputs only values greater than 0
-                    results.append((lhm_patents_idx[idx_patent_a], lhm_patents_idx[idx_patent_b], jaccard_similarity))
+                if intersection > 0:
+                    # Calculate Jaccard similarity
+                    union = num_tokens_a + num_tokens_b - intersection
+                    jaccard_similarity = intersection / union
+                    
+                    # Round to 6 digits
+                    jaccard_similarity = round(jaccard_similarity, 6)
+                    
+                    if jaccard_similarity > 0:
+                        results.append((patent_id_a, patent_id_b, jaccard_similarity))
         
         return results
     
     def jaccard_similarity(self, patents, inverted_index, f_similarity, lhm_patents_idx):
         """
-        Computes the pair-wise Jaccard similarity between patents using multiprocessing.
+        Computes the pair-wise Jaccard similarity between patents using optimized multiprocessing.
         
         Args:
             patents: The patent data.
@@ -153,105 +137,114 @@ class Stage05ComputeSimilarity:
             f_similarity: The file to store the computed similarities.
             lhm_patents_idx: The map containing the codified patent numbers.
         """
-        previous_patents = OrderedDict()
-        all_patent_ids = list(patents.keys())
-        total_patents = len(all_patent_ids)
-        
+        total_patents = len(patents)
         print(f"Computing similarities for {total_patents} patents using {self.num_processes} processes...")
         
-        # Prepare arguments for multiprocessing
-        batch_args = []
-        for idx_patent_a in all_patent_ids:
-            patent_a = patents[idx_patent_a]
-            num_kw_patent_a = len(patent_a)
-            batch_args.append((idx_patent_a, patent_a, num_kw_patent_a, patents, 
-                              inverted_index, previous_patents.copy(), lhm_patents_idx))
-            # Update previous_patents for subsequent batches
-            previous_patents[idx_patent_a] = 0
-        
-        # Use multiprocessing to compute similarities
-        results = []
-        processed = 0
         start_time = time.time()
         
-        # Create a pool of worker processes
+        # Create a list of patent IDs to ensure consistent ordering
+        patent_ids = list(patents.keys())
+        
+        # Optimize inverted index structure for lookups
+        token_to_patents = {}
+        for token, patent_list in inverted_index.items():
+            token_to_patents[token] = list(set(patent_list))  # Ensure uniqueness
+        
+        # Divide work into batches
+        batch_size = max(1, total_patents // (self.num_processes * 2))
+        batches = []
+        
+        for start_idx in range(0, total_patents, batch_size):
+            end_idx = min(start_idx + batch_size, total_patents)
+            batches.append((patent_ids, start_idx, end_idx, patents, token_to_patents))
+        
+        # Process batches in parallel
+        all_results = []
         with mp.Pool(processes=self.num_processes) as pool:
-            # Process patents in chunks for better progress reporting
-            chunk_size = max(1, min(1000, total_patents // (self.num_processes * 10)))
-            
-            # Use imap_unordered for better load balancing
-            for batch_results in pool.imap_unordered(self.calculate_similarities_for_patent, 
-                                                    batch_args, chunksize=chunk_size):
-                results.extend(batch_results)
-                processed += 1
+            batch_count = 0
+            for batch_results in pool.imap_unordered(self.process_patent_batch, batches):
+                all_results.extend(batch_results)
+                batch_count += 1
+                if batch_count % max(1, len(batches) // 10) == 0:
+                    print(f"\t\tProcessed {batch_count}/{len(batches)} batches, "
+                          f"found {len(all_results)} similarities so far...")
+        
+        print(f"Writing {len(all_results)} similarities to file...")
+        
+        # Write results to file
+        with open(f_similarity, 'w', encoding='utf-8') as pw_similarity:
+            for patent_id_a, patent_id_b, similarity in all_results:
+                original_pid_a = lhm_patents_idx.get(patent_id_a, patent_id_a)
+                original_pid_b = lhm_patents_idx.get(patent_id_b, patent_id_b)
+                pw_similarity.write(f"{original_pid_a} {original_pid_b} {similarity}\n")
+        
+        elapsed_time = time.time() - start_time
+        print(f"Completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+    
+    def jaccard_similarity_sequential(self, patents, inverted_index, f_similarity, lhm_patents_idx):
+        """
+        Sequential implementation of Jaccard similarity computation (optimized).
+        
+        Args:
+            patents: The patent data.
+            inverted_index: The inverted index of keywords and their associated patent numbers.
+            f_similarity: The file to store the computed similarities.
+            lhm_patents_idx: The map containing the codified patent numbers.
+        """
+        processed = 0
+        total_patents = len(patents)
+        start_time = time.time()
+        
+        # Create a list of patent IDs to ensure consistent ordering
+        patent_ids = list(patents.keys())
+        
+        with open(f_similarity, 'w', encoding='utf-8') as pw_similarity:
+            for i, patent_id_a in enumerate(patent_ids):
+                patent_a = patents[patent_id_a]
+                num_tokens_a = len(patent_a)
                 
+                # Find all patents that share at least one token with patent_a
+                candidates = set()
+                for token in patent_a:
+                    for patent_id in inverted_index.get(token, []):
+                        # Only process patents with higher indices to avoid duplicates
+                        if patent_id != patent_id_a and patent_ids.index(patent_id) > i:
+                            candidates.add(patent_id)
+                
+                # Calculate similarity for each candidate
+                for patent_id_b in candidates:
+                    patent_b = patents[patent_id_b]
+                    num_tokens_b = len(patent_b)
+                    
+                    # Calculate intersection
+                    intersection = sum(1 for token in patent_a if token in patent_b)
+                    
+                    if intersection > 0:
+                        # Calculate Jaccard similarity
+                        union = num_tokens_a + num_tokens_b - intersection
+                        jaccard_similarity = intersection / union
+                        
+                        # Round to 6 digits
+                        jaccard_similarity = round(jaccard_similarity, 6)
+                        
+                        if jaccard_similarity > 0:  # Outputs only values greater than 0
+                            original_pid_a = lhm_patents_idx.get(patent_id_a, patent_id_a)
+                            original_pid_b = lhm_patents_idx.get(patent_id_b, patent_id_b)
+                            pw_similarity.write(f"{original_pid_a} {original_pid_b} {jaccard_similarity}\n")
+                
+                processed += 1
                 if processed % 1000 == 0 or processed == total_patents:
                     elapsed = time.time() - start_time
                     patents_per_sec = processed / elapsed if elapsed > 0 else 0
                     progress = (processed / total_patents) * 100
                     print(f"\t\tProcessed: {processed}/{total_patents} patents ({progress:.1f}%), "
-                          f"Speed: {patents_per_sec:.1f} patents/sec, "
-                          f"Found: {len(results)} similarities")
-        
-        print(f"Writing {len(results)} similarities to file...")
-        
-        # Write results to file
-        with open(f_similarity, 'w', encoding='utf-8') as pw_similarity:
-            for patent_a, patent_b, similarity in results:
-                pw_similarity.write(f"{patent_a} {patent_b} {similarity}\n")
-    
-    def jaccard_similarity_sequential(self, patents, inverted_index, f_similarity, lhm_patents_idx):
-        """
-        Original sequential implementation of Jaccard similarity computation.
-        Kept for reference and comparison.
-        
-        Args:
-            patents: The patent data.
-            inverted_index: The inverted index of keywords and their associated patent numbers.
-            f_similarity: The file to store the computed similarities.
-            lhm_patents_idx: The map containing the codified patent numbers.
-        """
-        values = OrderedDict()
-        previous_patents = OrderedDict()
-        n = 0
-        
-        # Initialize values
-        for idx_patent in patents:
-            values[idx_patent] = 0
-        
-        with open(f_similarity, 'w', encoding='utf-8') as pw_similarity:
-            for idx_patent_a in patents:
-                previous_patents[idx_patent_a] = 0
-                patent_a = patents[idx_patent_a]
-                num_kw_patent_a = len(patent_a)
-                
-                values.clear()
-                self.process_patents(patent_a, values, patents, inverted_index, previous_patents)
-                
-                for idx_patent_b, intersection in values.items():
-                    if idx_patent_b not in previous_patents:
-                        patent_b = patents[idx_patent_b]
-                        num_kw_patent_b = len(patent_b)
-                        
-                        union = (num_kw_patent_a + num_kw_patent_b) - intersection
-                        jaccard_similarity = intersection / union
-                        
-                        # Round to 6 digits
-                        round_sim = int(jaccard_similarity * 100000)
-                        jaccard_similarity = round_sim / 100000.0
-                        
-                        if jaccard_similarity > 0:  # Outputs only values greater than 0
-                            pw_similarity.write(f"{lhm_patents_idx[idx_patent_a]} {lhm_patents_idx[idx_patent_b]} {jaccard_similarity}\n")
-                
-                n += 1
-                if n % 10000 == 0:  # Outputs the progress of this process
-                    print(f"\t\t{n} patents processed...")
+                          f"Speed: {patents_per_sec:.1f} patents/sec")
 
 if __name__ == "__main__":
     import argparse
     
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Compute patent similarity using multiprocessing")
+    parser = argparse.ArgumentParser(description="Compute patent similarity using optimized multiprocessing")
     parser.add_argument("--dir", required=True, help="Working directory for data files")
     parser.add_argument("--start", type=int, default=2001, help="Start year for similarity calculation")
     parser.add_argument("--end", type=int, default=2003, help="End year for similarity calculation")
@@ -274,9 +267,9 @@ if __name__ == "__main__":
         os.makedirs(f_jaccard)
     
     # Create dictionaries to store patent data and inverted index
-    patents = OrderedDict()
-    inverted_index = defaultdict(list)
-    lhm_patents_idx = OrderedDict()
+    patents = {}
+    inverted_index = {}
+    lhm_patents_idx = {}
     
     print("Reading the codified patent numbers...")
     cs.read_indexes(f_patents_idxs, lhm_patents_idx)

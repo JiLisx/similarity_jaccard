@@ -1,13 +1,14 @@
 """
 # Date: Created on Apr 12, 2025 
-# Author: Ji Li (Modified with multiprocessing support)
+# Author: Ji Li (Modified with enhanced multiprocessing support)
 
 Patent Similarity Analysis 
 @cite Arts, S., Cassiman, B., & Gomez, J. C. (2017). Text matching to measure patent similarity. Strategic Management Journal.
 
 This script executes all stages of the patent similarity analysis pipeline in sequence,
-with multiprocessing support for the similarity computation stage.
+with optimized multiprocessing support for the similarity computation stage.
 """
+
 import os
 import time
 import argparse
@@ -16,7 +17,6 @@ from Stage02CodifyIdxPatents import Stage02CodifyIdxPatents
 from Stage03IndexPatents import Stage03IndexPatents
 from Stage04SplitDataPerYear import Stage04SplitDataPerYear
 from Stage05ComputeSimilarity import Stage05ComputeSimilarity
-from collections import OrderedDict, defaultdict
 
 def ensure_dir_exists(directory):
     """Create directory if it doesn't exist."""
@@ -142,8 +142,8 @@ def run_stage3(main_dir):
             print(f"ERROR: Input file {file} not found. Previous stages may not have completed successfully.")
             return False
     
-    vocabulary = OrderedDict()
-    patents_idxs = OrderedDict()
+    vocabulary = {}
+    patents_idxs = {}
     
     print("Loading codified vocabulary...")
     ip.read_indexes(f_vocabulary, vocabulary)
@@ -191,7 +191,7 @@ def run_stage4(main_dir):
     return True
 
 def run_stage5(main_dir, start_year, end_year, num_processes, sequential=False):
-    """Compute Jaccard similarity for patents within each year using multiprocessing"""
+    """Compute Jaccard similarity for patents within each year using optimized multiprocessing"""
     print("\n" + "="*80)
     print(f"STAGE 5: Computing Jaccard Similarity (Years {start_year}-{end_year})")
     if sequential:
@@ -216,9 +216,9 @@ def run_stage5(main_dir, start_year, end_year, num_processes, sequential=False):
     
     ensure_dir_exists(f_jaccard)
     
-    patents = OrderedDict()
-    inverted_index = defaultdict(list)
-    lhm_patents_idx = OrderedDict()
+    patents = {}
+    inverted_index = {}
+    lhm_patents_idx = {}
     
     print("Reading the codified patent numbers...")
     cs.read_indexes(f_patents_idxs, lhm_patents_idx)
@@ -247,7 +247,6 @@ def run_stage5(main_dir, start_year, end_year, num_processes, sequential=False):
             print(f"\tReading data for year = {year}")
             cs.read_patents_sequentially(f_year_data, patents, inverted_index)
             
-            f_similarity = os.path.join(f_jaccard, f"jaccard_{year}.txt")
             print("\tDoing the calculations...")
             
             if sequential:
@@ -266,7 +265,7 @@ def run_stage5(main_dir, start_year, end_year, num_processes, sequential=False):
     return success
 
 def main():
-    parser = argparse.ArgumentParser(description='Patent Similarity Analysis Pipeline with Multiprocessing')
+    parser = argparse.ArgumentParser(description='Patent Similarity Analysis Pipeline with Optimized Multiprocessing')
     parser.add_argument('--dir', type=str, required=True, help='Working directory for data files')
     parser.add_argument('--start', type=int, default=2001, help='Start year for similarity calculation (default: 2001)')
     parser.add_argument('--end', type=int, default=2003, help='End year for similarity calculation (default: 2003)')
