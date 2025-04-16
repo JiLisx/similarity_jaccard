@@ -2,7 +2,7 @@
 Patent Citation Pair Similarity Calculator
 
 This script calculates Jaccard similarity between citation pairs (citing-cited patents)
-based on their titles and abstracts.
+based on their titles and abstracts, with multiprocessing support and TXT output.
 """
 
 import os
@@ -11,6 +11,8 @@ import time
 import argparse
 from collections import defaultdict
 import re
+import multiprocessing as mp
+from functools import partial
 from EnglishStopWords import EnglishStopWords
 
 class PatentCitationSimilarity:
@@ -60,7 +62,7 @@ class PatentCitationSimilarity:
         Load and preprocess patent data from CSV file
         
         Args:
-            patents_file: CSV file with pnrn,title,abstract columns
+            patents_file: CSV file with pnrn,title_en,abstract_en columns
         """
         print(f"Loading patent data from {patents_file}...")
         start_time = time.time()
@@ -101,59 +103,100 @@ class PatentCitationSimilarity:
         union = len(set_a.union(set_b))
         return intersection / union
     
-    def process_citation_pairs(self, citation_file, output_file):
+    def process_chunk(self, chunk, patent_data):
         """
-        Process citation pairs and calculate similarity for each pair
+        Process a chunk of citation pairs
+        
+        Args:
+            chunk: List of (citing_id, cited_id) tuples
+            patent_data: Dictionary of patent ID to token set
+            
+        Returns:
+            List of (citing_id, cited_id, similarity) and set of missing patents
+        """
+        results = []
+        missing_patents = set()
+        
+        for citing_id, cited_id in chunk:
+            if citing_id in patent_data and cited_id in patent_data:
+                similarity = self.calculate_jaccard_similarity(
+                    patent_data[citing_id], 
+                    patent_data[cited_id]
+                )
+                results.append((citing_id, cited_id, similarity))
+            else:
+                if citing_id not in patent_data:
+                    missing_patents.add(citing_id)
+                if cited_id not in patent_data:
+                    missing_patents.add(cited_id)
+                    
+        return results, missing_patents
+    
+    def process_citation_pairs(self, citation_file, output_file, num_processes=None):
+        """
+        Process citation pairs and calculate similarity for each pair using multiprocessing
         
         Args:
             citation_file: CSV file with citing_ida,uniq_cited_id columns
             output_file: Output file to write results
+            num_processes: Number of processes to use (default: CPU count)
         """
         print(f"Processing citation pairs from {citation_file}...")
         start_time = time.time()
         
-        # Count statistics
-        total_pairs = 0
-        processed_pairs = 0
-        missing_patents = set()
+        # Determine number of processes
+        if num_processes is None:
+            num_processes = mp.cpu_count()
         
-        with open(citation_file, 'r', encoding='utf-8') as f_in, \
-             open(output_file, 'w', encoding='utf-8') as f_out:
+        print(f"Using {num_processes} processes for parallel computation")
+        
+        # Read all citation pairs
+        citation_pairs = []
+        with open(citation_file, 'r', encoding='utf-8') as f_in:
+            reader = csv.DictReader(f_in)
+            for row in reader:
+                citing_id = row['citing_ida'].strip()
+                cited_id = row['uniq_cited_id'].strip()
+                citation_pairs.append((citing_id, cited_id))
+        
+        total_pairs = len(citation_pairs)
+        print(f"Found {total_pairs} citation pairs to process")
+        
+        # If just a few pairs, use single process
+        if total_pairs < 100 or num_processes == 1:
+            print("Using single process due to small number of pairs")
+            results, missing_patents = self.process_chunk(citation_pairs, self.patents_data)
+        else:
+            # Split work into chunks for multiprocessing
+            chunk_size = max(1, total_pairs // (num_processes * 2))
+            chunks = [citation_pairs[i:i + chunk_size] for i in range(0, total_pairs, chunk_size)]
+            print(f"Split work into {len(chunks)} chunks (chunk size: ~{chunk_size})")
             
+            # Process chunks in parallel
+            pool = mp.Pool(processes=num_processes)
+            process_func = partial(self.process_chunk, patent_data=self.patents_data)
+            chunk_results = pool.map(process_func, chunks)
+            pool.close()
+            pool.join()
+            
+            # Combine results
+            results = []
+            missing_patents = set()
+            for chunk_result, chunk_missing in chunk_results:
+                results.extend(chunk_result)
+                missing_patents.update(chunk_missing)
+        
+        # Write results to output file (TXT format, space-separated)
+        processed_pairs = len(results)
+        print(f"Writing {processed_pairs} similarity results to {output_file}")
+        
+        with open(output_file, 'w', encoding='utf-8') as f_out:
             # Write header
             f_out.write("citing_ida,uniq_cited_id,similarity\n")
             
-            # Skip header in input file
-            reader = csv.DictReader(f_in)
-            
-            for row in reader:
-                total_pairs += 1
-                citing_id = row['citing_ida'].strip()
-                cited_id = row['uniq_cited_id'].strip()
-                
-                # Check if both patents exist in our data
-                if citing_id in self.patents_data and cited_id in self.patents_data:
-                    # Calculate Jaccard similarity
-                    similarity = self.calculate_jaccard_similarity(
-                        self.patents_data[citing_id], 
-                        self.patents_data[cited_id]
-                    )
-                    
-                    # Write result to output file
-                    f_out.write(f"{citing_id},{cited_id},{similarity:.6f}\n")
-                    processed_pairs += 1
-                else:
-                    # Track missing patents
-                    if citing_id not in self.patents_data:
-                        missing_patents.add(citing_id)
-                    if cited_id not in self.patents_data:
-                        missing_patents.add(cited_id)
-                
-                # Progress reporting
-                if total_pairs % 10000 == 0:
-                    elapsed = time.time() - start_time
-                    print(f"Processed {total_pairs} citation pairs, "
-                          f"successfully calculated {processed_pairs} similarities...")
+            # Write results sorted by citing_id then cited_id for consistency
+            for citing_id, cited_id, similarity in sorted(results):
+                f_out.write(f"{citing_id},{cited_id},{similarity:.6f}\n")
         
         elapsed = time.time() - start_time
         print(f"Completed processing {total_pairs} citation pairs in {elapsed:.2f} seconds.")
@@ -170,9 +213,10 @@ class PatentCitationSimilarity:
 
 def main():
     parser = argparse.ArgumentParser(description='Calculate similarity between patent citation pairs')
-    parser.add_argument('--patents', required=True, help='CSV file with patent data (pnrn,title,abstract)')
+    parser.add_argument('--patents', required=True, help='CSV file with patent data (pnrn,title_en,abstract_en)')
     parser.add_argument('--citations', required=True, help='CSV file with citation pairs (citing_ida,uniq_cited_id)')
-    parser.add_argument('--output', required=True, help='Output file for similarity results')
+    parser.add_argument('--output', required=True, help='Output file for similarity results (TXT format)')
+    parser.add_argument('--processes', type=int, default=None, help='Number of processes to use (default: CPU count)')
     args = parser.parse_args()
     
     # Create directory for output file if it doesn't exist
@@ -183,7 +227,7 @@ def main():
     # Initialize and run the similarity calculator
     calculator = PatentCitationSimilarity()
     calculator.load_patent_data(args.patents)
-    calculator.process_citation_pairs(args.citations, args.output)
+    calculator.process_citation_pairs(args.citations, args.output, args.processes)
     
     print("Patent citation similarity calculation completed!")
 
