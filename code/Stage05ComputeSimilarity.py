@@ -159,27 +159,60 @@ class Stage05ComputeSimilarity:
             batches.append((patent_ids, start_idx, end_idx, patents, token_to_patents))
         
         # Process batches in parallel
-        all_results = []
-        with mp.Pool(processes=self.num_processes) as pool:
-            batch_count = 0
-            for batch_results in pool.imap_unordered(self.process_patent_batch, batches):
-                all_results.extend(batch_results)
-                batch_count += 1
-                if batch_count % max(1, len(batches) // 10) == 0:
-                    print(f"\t\tProcessed {batch_count}/{len(batches)} batches, "
-                          f"found {len(all_results)} similarities so far...")
-        
-        print(f"Writing {len(all_results)} similarities to file...")
-        
-        # Write results to file
-        with open(f_similarity, 'w', encoding='utf-8') as pw_similarity:
-            for patent_id_a, patent_id_b, similarity in all_results:
-                original_pid_a = lhm_patents_idx.get(patent_id_a, patent_id_a)
-                original_pid_b = lhm_patents_idx.get(patent_id_b, patent_id_b)
-                pw_similarity.write(f"{original_pid_a} {original_pid_b} {similarity}\n")
+        file_counter = 1
+        current_file = f_similarity
+        total_similarities = 0
+        file_handle = open(current_file, 'w', encoding='utf-8')
+
+        try:
+                # 处理批次
+                with mp.Pool(processes=self.num_processes) as pool:
+                    batch_count = 0
+                    for batch_results in pool.imap_unordered(self.process_patent_batch, batches):
+                        try:
+                            # 写入当前批次的结果
+                            for patent_id_a, patent_id_b, similarity in batch_results:
+                                original_pid_a = lhm_patents_idx.get(patent_id_a, patent_id_a)
+                                original_pid_b = lhm_patents_idx.get(patent_id_b, patent_id_b)
+                                file_handle.write(f"{original_pid_a} {original_pid_b} {similarity}\n")
+                            
+                            total_similarities += len(batch_results)
+                            batch_count += 1
+                            
+                            # 输出进度
+                            if batch_count % max(1, len(batches) // 10) == 0:
+                                print(f"\t\tProcessed {batch_count}/{len(batches)} batches, "
+                                    f"found {total_similarities} similarities so far...")
+                        
+                        except Exception as e:
+                            # 如果写入时出错，可能是因为结果太大
+                            # 关闭当前文件，创建新文件继续写入
+                            print(f"\t\tEncountered an issue, creating new output file: {e}")
+                            file_handle.close()
+                            file_counter += 1
+                            current_file = f"{f_similarity}.part{file_counter}"
+                            file_handle = open(current_file, 'w', encoding='utf-8')
+                            
+                            # 重试写入失败的批次
+                            for patent_id_a, patent_id_b, similarity in batch_results:
+                                original_pid_a = lhm_patents_idx.get(patent_id_a, patent_id_a)
+                                original_pid_b = lhm_patents_idx.get(patent_id_b, patent_id_b)
+                                file_handle.write(f"{original_pid_a} {original_pid_b} {similarity}\n")
+            
+        finally:
+            # 确保文件被关闭
+            file_handle.close()
         
         elapsed_time = time.time() - start_time
         print(f"Completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+        print(f"Total similarities found: {total_similarities}")
+        
+        if file_counter > 1:
+            print(f"Results were split across {file_counter} files due to size constraints:")
+            print(f"  - {f_similarity} (main file)")
+            for i in range(2, file_counter + 1):
+                print(f"  - {f_similarity}.part{i}")
+                    
     
     def jaccard_similarity_sequential(self, patents, inverted_index, f_similarity, lhm_patents_idx):
         """
