@@ -1,28 +1,34 @@
 """
 # Date: Created on Apr 12, 2025 
-# Author: Ji Li (Modified with optimized multiprocessing support)
+# Author: Ji Li
 
 @cite Arts, S., Cassiman, B., & Gomez, J. C. (2017). Text matching to measure patent similarity. Strategic Management Journal.
 
 Compute pair-wise Jaccard similarity between patents in the same year with optimized multiprocessing support.
+Now includes functionality to keep only the TOP-N most similar patent pairs to reduce storage requirements.
 Compatible with Python 3.6+
 """
 import os
 import time
+import heapq
 import multiprocessing as mp
 from functools import partial
+from collections import defaultdict
 
 class Stage05ComputeSimilarity:
     
-    def __init__(self, num_processes=None):
+    def __init__(self, num_processes=None, top_n=None):
         """
         Constructor
         
         Args:
             num_processes: Number of processes to use for multiprocessing.
                           If None, use available CPU count.
+            top_n: If specified, only store the top N most similar patent pairs.
+                  If None, store all similarities.
         """
         self.num_processes = num_processes if num_processes is not None else mp.cpu_count()
+        self.top_n = top_n
     
     def read_indexes(self, f_input, lhm):
         """
@@ -79,12 +85,13 @@ class Stage05ComputeSimilarity:
         Process a batch of patents to find similarities
         
         Args:
-            batch_data: Tuple containing (patent_ids, batch_start, batch_end, patents, inverted_index)
+            batch_data: Tuple containing (patent_ids, batch_start, batch_end, patents, inverted_index, top_n)
             
         Returns:
-            List of similarity tuples (patent_a, patent_b, similarity)
+            If top_n is specified, returns the top_n most similar patent pairs.
+            Otherwise, returns all similarity tuples (patent_a, patent_b, similarity)
         """
-        patent_ids, batch_start, batch_end, patents, token_to_patents = batch_data
+        patent_ids, batch_start, batch_end, patents, token_to_patents, top_n = batch_data
         
         results = []
         
@@ -123,13 +130,31 @@ class Stage05ComputeSimilarity:
                     jaccard_similarity = round(jaccard_similarity, 6)
                     
                     if jaccard_similarity > 0:
-                        results.append((patent_id_a, patent_id_b, jaccard_similarity))
+                        # Use negative similarity for max-heap behavior with a min-heap
+                        if top_n is not None:
+                            heapq.heappush(results, (-jaccard_similarity, patent_id_a, patent_id_b))
+                            # If we've exceeded top_n, remove the lowest similarity
+                            if len(results) > top_n:
+                                heapq.heappop(results)
+                        else:
+                            results.append((patent_id_a, patent_id_b, jaccard_similarity))
+        
+        # If using top_n, convert the results back to the expected format
+        if top_n is not None:
+            # Convert (-similarity, id_a, id_b) to (id_a, id_b, similarity)
+            temp_results = [
+                (pid_a, pid_b, -sim) for sim, pid_a, pid_b in results
+            ]
+            # Sort by similarity in descending order
+            temp_results.sort(key=lambda x: x[2], reverse=True)
+            return temp_results
         
         return results
     
     def jaccard_similarity(self, patents, inverted_index, f_similarity, lhm_patents_idx):
         """
         Computes the pair-wise Jaccard similarity between patents using optimized multiprocessing.
+        If self.top_n is specified, only the top N most similar patent pairs are saved.
         
         Args:
             patents: The patent data.
@@ -138,7 +163,11 @@ class Stage05ComputeSimilarity:
             lhm_patents_idx: The map containing the codified patent numbers.
         """
         total_patents = len(patents)
-        print(f"Computing similarities for {total_patents} patents using {self.num_processes} processes...")
+        if self.top_n:
+            print(f"Computing similarities for {total_patents} patents using {self.num_processes} processes...")
+            print(f"Only storing the TOP {self.top_n} most similar patent pairs.")
+        else:
+            print(f"Computing similarities for {total_patents} patents using {self.num_processes} processes...")
         
         start_time = time.time()
         
@@ -156,67 +185,49 @@ class Stage05ComputeSimilarity:
         
         for start_idx in range(0, total_patents, batch_size):
             end_idx = min(start_idx + batch_size, total_patents)
-            batches.append((patent_ids, start_idx, end_idx, patents, token_to_patents))
+            batches.append((patent_ids, start_idx, end_idx, patents, token_to_patents, self.top_n))
+        
+        all_similarities = []
         
         # Process batches in parallel
-        file_counter = 1
-        current_file = f_similarity
-        total_similarities = 0
-        file_handle = open(current_file, 'w', encoding='utf-8')
-
-        try:
-                # 处理批次
-                with mp.Pool(processes=self.num_processes) as pool:
-                    batch_count = 0
-                    for batch_results in pool.imap_unordered(self.process_patent_batch, batches):
-                        try:
-                            # 写入当前批次的结果
-                            for patent_id_a, patent_id_b, similarity in batch_results:
-                                original_pid_a = lhm_patents_idx.get(patent_id_a, patent_id_a)
-                                original_pid_b = lhm_patents_idx.get(patent_id_b, patent_id_b)
-                                file_handle.write(f"{original_pid_a} {original_pid_b} {similarity}\n")
-                            
-                            total_similarities += len(batch_results)
-                            batch_count += 1
-                            
-                            # 输出进度
-                            if batch_count % max(1, len(batches) // 10) == 0:
-                                print(f"\t\tProcessed {batch_count}/{len(batches)} batches, "
-                                    f"found {total_similarities} similarities so far...")
-                        
-                        except Exception as e:
-                            # 如果写入时出错，可能是因为结果太大
-                            # 关闭当前文件，创建新文件继续写入
-                            print(f"\t\tEncountered an issue, creating new output file: {e}")
-                            file_handle.close()
-                            file_counter += 1
-                            current_file = f"{f_similarity}.part{file_counter}"
-                            file_handle = open(current_file, 'w', encoding='utf-8')
-                            
-                            # 重试写入失败的批次
-                            for patent_id_a, patent_id_b, similarity in batch_results:
-                                original_pid_a = lhm_patents_idx.get(patent_id_a, patent_id_a)
-                                original_pid_b = lhm_patents_idx.get(patent_id_b, patent_id_b)
-                                file_handle.write(f"{original_pid_a} {original_pid_b} {similarity}\n")
-            
-        finally:
-            # 确保文件被关闭
-            file_handle.close()
+        with mp.Pool(processes=self.num_processes) as pool:
+            batch_count = 0
+            for batch_results in pool.imap_unordered(self.process_patent_batch, batches):
+                all_similarities.extend(batch_results)
+                batch_count += 1
+                
+                # Output progress
+                if batch_count % max(1, len(batches) // 10) == 0:
+                    print(f"\t\tProcessed {batch_count}/{len(batches)} batches, "
+                          f"found {len(all_similarities)} similarities so far...")
+        
+        # If we're keeping the top N, we need to sort all similarities and take the top N
+        if self.top_n:
+            print(f"\t\tSorting {len(all_similarities)} similarities to find the top {self.top_n}...")
+            all_similarities.sort(key=lambda x: x[2], reverse=True)  # Sort by similarity in descending order
+            all_similarities = all_similarities[:self.top_n]  # Keep only the top N
+        
+        # Write the final similarities to file
+        with open(f_similarity, 'w', encoding='utf-8') as file_handle:
+            for entry in all_similarities:
+                if len(entry) == 3:  # Standard format (patent_id_a, patent_id_b, similarity)
+                    patent_id_a, patent_id_b, similarity = entry
+                else:  # For compatibility with older format if needed
+                    patent_id_a, patent_id_b = entry[:2]
+                    similarity = entry[2] if len(entry) > 2 else 0
+                    
+                original_pid_a = lhm_patents_idx.get(patent_id_a, patent_id_a)
+                original_pid_b = lhm_patents_idx.get(patent_id_b, patent_id_b)
+                file_handle.write(f"{original_pid_a} {original_pid_b} {similarity}\n")
         
         elapsed_time = time.time() - start_time
         print(f"Completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
-        print(f"Total similarities found: {total_similarities}")
-        
-        if file_counter > 1:
-            print(f"Results were split across {file_counter} files due to size constraints:")
-            print(f"  - {f_similarity} (main file)")
-            for i in range(2, file_counter + 1):
-                print(f"  - {f_similarity}.part{i}")
-                    
+        print(f"Total similarities saved: {len(all_similarities)}")
     
     def jaccard_similarity_sequential(self, patents, inverted_index, f_similarity, lhm_patents_idx):
         """
         Sequential implementation of Jaccard similarity computation (optimized).
+        If self.top_n is specified, only the top N most similar patent pairs are saved.
         
         Args:
             patents: The patent data.
@@ -231,7 +242,18 @@ class Stage05ComputeSimilarity:
         # Create a list of patent IDs to ensure consistent ordering
         patent_ids = list(patents.keys())
         
-        with open(f_similarity, 'w', encoding='utf-8') as pw_similarity:
+        # If keeping only top N, we'll collect all similarities and sort at the end
+        if self.top_n:
+            print(f"Only storing the TOP {self.top_n} most similar patent pairs.")
+            similarities = []
+        else:
+            similarities = None
+            
+        # Open the output file
+        if not self.top_n:
+            output_file = open(f_similarity, 'w', encoding='utf-8')
+        
+        try:
             for i, patent_id_a in enumerate(patent_ids):
                 patent_a = patents[patent_id_a]
                 num_tokens_a = len(patent_a)
@@ -260,18 +282,51 @@ class Stage05ComputeSimilarity:
                         # Round to 6 digits
                         jaccard_similarity = round(jaccard_similarity, 6)
                         
-                        if jaccard_similarity > 0:  # Outputs only values greater than 0
-                            original_pid_a = lhm_patents_idx.get(patent_id_a, patent_id_a)
-                            original_pid_b = lhm_patents_idx.get(patent_id_b, patent_id_b)
-                            pw_similarity.write(f"{original_pid_a} {original_pid_b} {jaccard_similarity}\n")
+                        if jaccard_similarity > 0:  # Only process values greater than 0
+                            if self.top_n:
+                                # If using top_n, collect the similarities for later sorting
+                                similarities.append((patent_id_a, patent_id_b, jaccard_similarity))
+                                # Optional: Keep the list size manageable if it gets very large
+                                if len(similarities) > self.top_n * 100:
+                                    similarities.sort(key=lambda x: x[2], reverse=True)
+                                    similarities = similarities[:self.top_n]
+                            else:
+                                # Otherwise, write to file immediately
+                                original_pid_a = lhm_patents_idx.get(patent_id_a, patent_id_a)
+                                original_pid_b = lhm_patents_idx.get(patent_id_b, patent_id_b)
+                                output_file.write(f"{original_pid_a} {original_pid_b} {jaccard_similarity}\n")
                 
                 processed += 1
                 if processed % 1000 == 0 or processed == total_patents:
                     elapsed = time.time() - start_time
                     patents_per_sec = processed / elapsed if elapsed > 0 else 0
                     progress = (processed / total_patents) * 100
-                    print(f"\t\tProcessed: {processed}/{total_patents} patents ({progress:.1f}%), "
-                          f"Speed: {patents_per_sec:.1f} patents/sec")
+                    if self.top_n:
+                        print(f"\t\tProcessed: {processed}/{total_patents} patents ({progress:.1f}%), "
+                              f"Speed: {patents_per_sec:.1f} patents/sec, Collected: {len(similarities)} similarities")
+                    else:
+                        print(f"\t\tProcessed: {processed}/{total_patents} patents ({progress:.1f}%), "
+                              f"Speed: {patents_per_sec:.1f} patents/sec")
+        
+        finally:
+            # Close the output file if we've been writing to it
+            if not self.top_n and 'output_file' in locals():
+                output_file.close()
+        
+        # If we're keeping only the top N, sort all similarities and save only the top N
+        if self.top_n:
+            print(f"\t\tSorting {len(similarities)} similarities to find the top {self.top_n}...")
+            similarities.sort(key=lambda x: x[2], reverse=True)  # Sort by similarity in descending order
+            similarities = similarities[:self.top_n]  # Keep only the top N
+            
+            # Write the top N similarities to file
+            with open(f_similarity, 'w', encoding='utf-8') as output_file:
+                for patent_id_a, patent_id_b, similarity in similarities:
+                    original_pid_a = lhm_patents_idx.get(patent_id_a, patent_id_a)
+                    original_pid_b = lhm_patents_idx.get(patent_id_b, patent_id_b)
+                    output_file.write(f"{original_pid_a} {original_pid_b} {similarity}\n")
+            
+            print(f"Saved the top {len(similarities)} most similar patent pairs.")
 
 if __name__ == "__main__":
     import argparse
@@ -282,7 +337,7 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=int, default=2001, help="Start year for similarity calculation")
     parser.add_argument("--end", type=int, default=2003, help="End year for similarity calculation")
     parser.add_argument("--processes", type=int, default=None, help="Number of processes to use (default: all available cores)")
-    parser.add_argument("--sequential", action="store_true", help="Use sequential processing instead of multiprocessing")
+    parser.add_argument("--top", type=int, default=None, help="Only keep the top N most similar patent pairs per year")
     
     args = parser.parse_args()
     
@@ -290,8 +345,8 @@ if __name__ == "__main__":
     init_year = args.start
     end_year = args.end
     
-    # Initialize with specified number of processes
-    cs = Stage05ComputeSimilarity(num_processes=args.processes)
+    # Initialize with specified number of processes and top_n
+    cs = Stage05ComputeSimilarity(num_processes=args.processes, top_n=args.top)
     
     f_patents_idxs = os.path.join(main_dir, "patents_idxs.txt")
     f_jaccard = os.path.join(main_dir, "jaccard")
@@ -324,13 +379,8 @@ if __name__ == "__main__":
             
             f_similarity = os.path.join(f_jaccard, f"jaccard_{year}.txt")
             print("\tDoing the calculations...")
-            
-            if args.sequential:
-                print("\tUsing sequential processing")
-                cs.jaccard_similarity_sequential(patents, inverted_index, f_similarity, lhm_patents_idx)
-            else:
-                print(f"\tUsing {cs.num_processes} processes")
-                cs.jaccard_similarity(patents, inverted_index, f_similarity, lhm_patents_idx)
+            print(f"\tUsing {cs.num_processes} processes")
+            cs.jaccard_similarity(patents, inverted_index, f_similarity, lhm_patents_idx)
             
             year_elapsed = time.time() - year_start_time
             print(f"\tCompleted year {year} in {year_elapsed:.2f} seconds ({year_elapsed/60:.2f} minutes)")

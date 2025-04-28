@@ -1,6 +1,6 @@
 """
 # Date: Created on Apr 12, 2025 
-# Author: Ji Li (Modified with enhanced multiprocessing support)
+# Author: Ji Li
 
 Patent Similarity Analysis 
 @cite Arts, S., Cassiman, B., & Gomez, J. C. (2017). Text matching to measure patent similarity. Strategic Management Journal.
@@ -190,17 +190,16 @@ def run_stage4(main_dir):
     
     return True
 
-def run_stage5(main_dir, start_year, end_year, num_processes, sequential=False):
+def run_stage5(main_dir, start_year, end_year, num_processes, top_n=None):
     """Compute Jaccard similarity for patents within each year using optimized multiprocessing"""
     print("\n" + "="*80)
     print(f"STAGE 5: Computing Jaccard Similarity (Years {start_year}-{end_year})")
-    if sequential:
-        print("Mode: Sequential processing")
-    else:
-        print(f"Mode: Multiprocessing with {num_processes if num_processes else 'all available'} processes")
+    print(f"Mode: Multiprocessing with {num_processes if num_processes else 'all available'} processes")
+    if top_n:
+        print(f"Storage optimization: Keeping only TOP {top_n} most similar patent pairs per year")
     print("="*80)
     
-    cs = Stage05ComputeSimilarity(num_processes=num_processes)
+    cs = Stage05ComputeSimilarity(num_processes=num_processes, top_n=top_n)
     
     f_patents_idxs = os.path.join(main_dir, "patents_idxs.txt")
     f_jaccard = os.path.join(main_dir, "jaccard")
@@ -234,11 +233,23 @@ def run_stage5(main_dir, start_year, end_year, num_processes, sequential=False):
         f_year_data = os.path.join(main_dir, f"years/patents_indexed_{year}.txt")
         f_similarity = os.path.join(f_jaccard, f"jaccard_{year}.txt")
         
-        # Check that the similarity file for the year already exists and is not empty
+        # Check if we already have computed this year
         if os.path.exists(f_similarity) and os.path.getsize(f_similarity) > 0:
-            print(f"Similarity calculation for \t year {year} has been completed, skipping...")
-            success = True
-            continue
+            # If we're using top_n and this is a full similarity file, we might want to recompute
+            if top_n:
+                with open(f_similarity, 'r', encoding='utf-8') as f:
+                    line_count = sum(1 for _ in f)
+                
+                if line_count > top_n * 1.5:  # If the file has significantly more than top_n entries
+                    print(f"\tRecomputing TOP {top_n} similarities for year {year}...")
+                else:
+                    print(f"\tSimilarity file for year {year} already has approximately TOP {top_n}, skipping...")
+                    success = True
+                    continue
+            else:
+                print(f"\tSimilarity calculation for year {year} has been completed, skipping...")
+                success = True
+                continue
         
         if os.path.exists(f_year_data):
             year_start_time = time.time()
@@ -248,11 +259,7 @@ def run_stage5(main_dir, start_year, end_year, num_processes, sequential=False):
             cs.read_patents_sequentially(f_year_data, patents, inverted_index)
             
             print("\tDoing the calculations...")
-            
-            if sequential:
-                cs.jaccard_similarity_sequential(patents, inverted_index, f_similarity, lhm_patents_idx)
-            else:
-                cs.jaccard_similarity(patents, inverted_index, f_similarity, lhm_patents_idx)
+            cs.jaccard_similarity(patents, inverted_index, f_similarity, lhm_patents_idx)
             
             year_elapsed = time.time() - year_start_time
             print(f"\tCompleted year {year} in {year_elapsed:.2f} seconds ({year_elapsed/60:.2f} minutes)")
@@ -271,7 +278,7 @@ def main():
     parser.add_argument('--end', type=int, default=2003, help='End year for similarity calculation (default: 2003)')
     parser.add_argument('--stage', type=int, default=0, help='Start from specific stage (1-5, 0 for all stages)')
     parser.add_argument('--processes', type=int, default=None, help='Number of processes to use for multiprocessing (default: all available cores)')
-    parser.add_argument('--sequential', action='store_true', help='Use sequential processing instead of multiprocessing')
+    parser.add_argument('--top', type=int, default=None, help='Only keep the top N most similar patent pairs per year (default: keep all)')
     args = parser.parse_args()
     
     main_dir = args.dir
@@ -279,7 +286,7 @@ def main():
     end_year = args.end
     start_stage = args.stage
     num_processes = args.processes
-    sequential = args.sequential
+    top_n = args.top
     
     # Create main directory if it doesn't exist
     ensure_dir_exists(main_dir)
@@ -316,7 +323,7 @@ def main():
             return
     
     if start_stage <= 5:
-        if run_stage5(main_dir, start_year, end_year, num_processes, sequential):
+        if run_stage5(main_dir, start_year, end_year, num_processes, top_n):
             print("Stage 5 completed successfully!")
         else:
             print("Stage 5 encountered issues but completed.")
