@@ -1,8 +1,7 @@
 """
-Patent Citation Pair Similarity Calculator - Streaming Version
-
-This script calculates Jaccard similarity between citation pairs (citing-cited patents)
-using a streaming approach that minimizes memory usage by processing one pair at a time.
+Patent Citation Pair Similarity - Optimized for Large Datasets with Enhanced Multiprocessing
+Author: Ji Li (Modified)
+Date: May 3, 2025
 """
 
 import os
@@ -11,374 +10,388 @@ import time
 import argparse
 import re
 import multiprocessing as mp
-from functools import partial
+import gc
+
+
+# Import required components from the existing codebase
+from Stage01PreprocessData import Stage01PreprocessData
 from EnglishStopWords import EnglishStopWords
 
-class StreamingPatentSimilarity:
+def ensure_dir_exists(directory):
+    """Create directory if it doesn't exist."""
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+        print(f"Created directory: {directory}")
+
+def load_vocabulary(vocabulary_path):
+    """
+    Load the shared vocabulary using the same method as in main_script.py
+    """
+    print(f"Loading shared vocabulary from {vocabulary_path}...")
+    vocabulary = {}
     
-    def __init__(self):
-        """Initialize the similarity calculator"""
-        self.sw = EnglishStopWords()  # Stopword list for preprocessing
-        self.patent_cache = {}  # Small LRU cache for recently used patents
-        self.max_cache_size = 1000  # Maximum number of patents to keep in cache
+    # Use the same preprocessing class for consistency
+    ppd = Stage01PreprocessData()
+    ppd.read_vocabulary(vocabulary_path, vocabulary)
     
-    def get_token_pattern(self):
-        """Define regex pattern to extract valid tokens from text"""
-        return re.compile(r'\b[a-zA-Z0-9][-a-zA-Z0-9]*[a-zA-Z0-9]\b')
+    print(f"Loaded {len(vocabulary)} terms from shared vocabulary")
+    return vocabulary
+
+def create_patent_index(patents_file):
+    """
+    Create an index of patent IDs to their positions in the file for fast lookup
+    """
+    print(f"Creating patent index for {patents_file}...")
+    patent_positions = {}
     
-    def tokenize(self, text):
-        """Split text into tokens and convert to lowercase"""
-        if not text or not isinstance(text, str):
-            return []
+    with open(patents_file, 'r', encoding='utf-8') as f:
+        # Skip header
+        header_pos = f.tell()
+        header = f.readline()
+        
+        # Find column indices using csv reader for proper handling
+        csv_reader = csv.reader([header])
+        header_cols = next(csv_reader)
+        pnr_idx = header_cols.index('pnr') if 'pnr' in header_cols else 0
+        
+        # Record position of each patent
+        line_count = 0
+        while True:
+            position = f.tell()
+            line = f.readline()
+            if not line:
+                break
+                
+            # Parse just enough to get patent ID using csv reader
+            csv_line_reader = csv.reader([line])
+            parts = next(csv_line_reader)
+            if len(parts) > pnr_idx:
+                patent_id = parts[pnr_idx].strip()
+                patent_positions[patent_id] = position
             
-        tokens = []
-        matcher = self.get_token_pattern().finditer(text)
-        for match in matcher:
-            tokens.append(match.group().lower())
-        return tokens
+            line_count += 1
+            if line_count % 1000000 == 0:
+                print(f"  Indexed {line_count} patents...")
     
-    def preprocess_patent_text(self, title, abstract):
-        """Create a clean set of tokens from patent title and abstract"""
-        # Combine title and abstract
-        text = f"{title} {abstract}" if title and abstract else (title or abstract or "")
-        text = text.lower()
-        
-        # Tokenize and filter
-        tokens = self.tokenize(text)
-        clean_tokens = set()
-        
-        for token in tokens:
-            # Remove stopwords, words formed only by numbers and words of only one character
-            if (not self.sw.is_stop_word(token) and 
-                len(token) > 1 and 
-                not token.isdigit() and
-                not re.match(r'[0-9]+(?:-[0-9]+)+$', token)):
-                clean_tokens.add(token)
-        
-        return clean_tokens
+    print(f"Indexed {len(patent_positions)} patents")
+    return patent_positions, header_pos
+
+def get_patent_data(patent_id, patents_file, patent_positions, header_pos, vocabulary, patent_cache, sw, ppd):
+    """
+    Retrieve and preprocess patent data for a specific patent ID
+    """
+    # Check cache first
+    if patent_id in patent_cache:
+        return patent_cache[patent_id]
     
-    def create_patent_index(self, patents_file):
-        """
-        Create an index of patent IDs to their positions in the file for fast lookup
-        
-        Args:
-            patents_file: CSV file with patent data
-            
-        Returns:
-            Dictionary mapping patent IDs to file positions
-        """
-        print(f"Creating patent index for {patents_file}...")
-        patent_positions = {}
-        
+    # If not in cache, check if we have position information
+    if patent_id in patent_positions:
         with open(patents_file, 'r', encoding='utf-8') as f:
-            # Skip header
-            header_pos = f.tell()
-            header = f.readline()
+            # Read header to get column indices
+            f.seek(header_pos)
+            csv_reader = csv.reader(f)
+            header = next(csv_reader)
+            
+            title_idx = header.index('title_en') if 'title_en' in header else 2
+            abstract_idx = header.index('abstract_en') if 'abstract_en' in header else 3
+            
+            # Jump to the patent's position
+            f.seek(patent_positions[patent_id])
+            line = f.readline()
+            
+            # Parse the CSV line properly
+            csv_line_reader = csv.reader([line])
+            parts = next(csv_line_reader)
+            
+            if len(parts) > max(title_idx, abstract_idx):
+                # Extract title and abstract using the indices
+                if title_idx < len(parts) and abstract_idx < len(parts):
+                    title = parts[title_idx].strip()
+                    abstract = parts[abstract_idx].strip()
+                    
+                    # Check if title and abstract are not empty
+                    if not title or not abstract:
+                        return None
+                else:
+                    return None 
+                
+                # Combine title and abstract - using exactly the same approach as Stage01PreprocessData
+                text = f"{title} {abstract}".lower()
+                
+                # Use the original tokenization method from Stage01PreprocessData
+                tokens = ppd.tokenize(text)
+                
+                # Filter exactly as in Stage01PreprocessData.create_bag_of_words
+                filtered_tokens = set()
+                for token in tokens:
+                    # Apply the same filtering rules as in Stage01PreprocessData
+                    if (token in vocabulary and
+                        not sw.is_stop_word(token) and
+                        len(token) > 1 and
+                        not token.isdigit() and  # Filter pure numbers
+                        not re.match(r'[0-9]+(?:-[0-9]+)+$', token)):
+                        filtered_tokens.add(token)
+                
+                # Update cache with a copy of the set
+                if len(patent_cache) >= 10000:  # Fixed cache size
+                    # Remove least recently used item (first in the cache)
+                    patent_cache.pop(next(iter(patent_cache)))
+                patent_cache[patent_id] = filtered_tokens.copy()
+                
+                return filtered_tokens
+    
+    # Patent not found
+    return None
+
+def calculate_jaccard_similarity(set_a, set_b):
+    """
+    Calculate Jaccard similarity between two sets with rounding to 6 decimal places,
+    using exactly the same formula as in main_citation_control.py
+    """
+    # Return 0 for empty sets - consistent with other implementations
+    if not set_a or not set_b:
+        return 0.0
+        
+    # Calculate intersection
+    intersection = len(set_a.intersection(set_b))
+        
+    # Calculate union using set operations to ensure consistency
+    union = len(set_a.union(set_b))
+    
+    # Compute similarity and round to 6 decimal places - exactly like Stage05ComputeSimilarity
+    similarity = intersection / union
+    return round(similarity, 6)
+
+# Cache to share patent data between worker processes (shared dictionary)
+# Note: In Python multiprocessing, each process gets its own copy of global variables
+# So we'll create a manager to handle shared data if needed
+def initialize_worker(patents_file_arg, patent_positions_arg, header_pos_arg, vocabulary_arg):
+    """Initialize worker with shared data"""
+    global patents_file, patent_positions, header_pos, vocabulary, patent_cache, sw, ppd
+    patents_file = patents_file_arg
+    patent_positions = patent_positions_arg
+    header_pos = header_pos_arg
+    vocabulary = vocabulary_arg
+    patent_cache = {}  # Each worker maintains its own cache
+    sw = EnglishStopWords()  # Create stopwords instance
+    ppd = Stage01PreprocessData()  # Create preprocessor instance
+
+def process_citation_pair(pair_data):
+    """Process a single citation pair"""
+    citing_pnr, cited_pnr = pair_data
+    
+    # Access the global variables set in initialize_worker
+    global patents_file, patent_positions, header_pos, vocabulary, patent_cache, sw, ppd
+    
+    # Get patent data
+    citing_tokens = get_patent_data(citing_pnr, patents_file, patent_positions, 
+                                   header_pos, vocabulary, patent_cache, sw, ppd)
+    cited_tokens = get_patent_data(cited_pnr, patents_file, patent_positions, 
+                                  header_pos, vocabulary, patent_cache, sw, ppd)
+    
+    # Calculate similarity if both patents exist
+    if citing_tokens is not None and cited_tokens is not None:
+        similarity = calculate_jaccard_similarity(citing_tokens, cited_tokens)
+        return (citing_pnr, cited_pnr, similarity, None)
+    else:
+        # Return information about missing patents
+        missing = []
+        if citing_tokens is None:
+            missing.append(citing_pnr)
+        if cited_tokens is None:
+            missing.append(cited_pnr)
+        return (citing_pnr, cited_pnr, None, missing)
+
+def process_citation_pairs(patents_file, citation_file, output_file, vocabulary_path, num_processes=None):
+    """
+    Process citation pairs and calculate similarity using improved parallel processing
+    with better memory management and progress tracking
+    """
+    print(f"Processing citation pairs from {citation_file}...")
+    print(f"Using {num_processes} processes for parallel calculation" if num_processes else "Using all available CPU cores")
+    start_time = time.time()
+    
+    # Load vocabulary - using the exact same method as in main_script.py
+    vocabulary = load_vocabulary(vocabulary_path)
+    
+    # Create patent index for fast lookup
+    patent_positions, header_pos = create_patent_index(patents_file)
+    
+    # Count total number of citation pairs for progress reporting
+    total_pairs_count = 0
+    with open(citation_file, 'r', encoding='utf-8') as f:
+        # Skip header
+        next(f)
+        # Count lines
+        for _ in f:
+            total_pairs_count += 1
+    
+    print(f"Total citation pairs to process: {total_pairs_count}")
+    
+    # Check for resuming from previous run
+    processed_pairs = set()
+    if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+        with open(output_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith("citing_pnr"):  # Skip header
+                    continue
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    processed_pairs.add((parts[0], parts[1]))
+        
+        print(f"Resuming from {len(processed_pairs)} previously processed pairs")
+    
+    # Determine write mode
+    write_mode = 'a' if processed_pairs else 'w'
+    
+    # Create output and missing patents files
+    missing_patents_file = f"{os.path.splitext(output_file)[0]}_missing_patents.txt"
+    with open(output_file, write_mode, encoding='utf-8') as f_out, \
+         open(missing_patents_file, 'w', encoding='utf-8') as f_missing:
+        
+        # Write headers
+        if write_mode == 'w':
+            f_out.write("citing_pnr cited_pnr similarity\n")
+        f_missing.write("Missing patents\n")
+        
+        # Track progress
+        total_pairs = 0
+        successful_pairs = 0
+        missing_patents_count = 0
+        last_progress_time = time.time()
+        batch_size = 50000  # Larger batch size for better efficiency
+        
+        # Create citation pair batches
+        citation_pairs = []
+        with open(citation_file, 'r', encoding='utf-8') as f_in:
+            csv_reader = csv.reader(f_in)
+            header = next(csv_reader)
             
             # Find column indices
-            header_cols = header.strip().split(',')
-            pnr_idx = header_cols.index('pnr') if 'pnr' in header_cols else 0
+            citing_idx = header.index('citing_pnr') if 'citing_pnr' in header else 0
+            cited_idx = header.index('cited_pnr') if 'cited_pnr' in header else 1
             
-            # Record position of each patent
-            while True:
-                position = f.tell()
-                line = f.readline()
-                if not line:
-                    break
-                    
-                # Parse just enough to get patent ID
-                parts = line.split(',')
-                if len(parts) > pnr_idx:
-                    patent_id = parts[pnr_idx].strip()
-                    patent_positions[patent_id] = position
-        
-        print(f"Indexed {len(patent_positions)} patents")
-        return patent_positions, header_pos
-    
-    def get_patent_data(self, patent_id, patents_file, patent_positions, header_pos):
-        """
-        Retrieve patent data for a specific patent ID
-        
-        Args:
-            patent_id: Patent ID to retrieve
-            patents_file: CSV file with patent data
-            patent_positions: Dictionary mapping patent IDs to file positions
-            header_pos: Position of the header line in the file
-            
-        Returns:
-            Set of tokens for the patent or None if not found
-        """
-        # Check cache first
-        if patent_id in self.patent_cache:
-            return self.patent_cache[patent_id]
-        
-        # If not in cache, check if we have position information
-        if patent_id in patent_positions:
-            with open(patents_file, 'r', encoding='utf-8') as f:
-                # Read header to get column indices
-                f.seek(header_pos)
-                header = f.readline().strip().split(',')
+            for row in csv_reader:
+                if len(row) <= max(citing_idx, cited_idx):
+                    continue
                 
-                title_idx = header.index('title_en') if 'title_en' in header else 1
-                abstract_idx = header.index('abstract_en') if 'abstract_en' in header else 2
+                citing_pnr = row[citing_idx].strip()
+                cited_pnr = row[cited_idx].strip()
+                total_pairs += 1
                 
-                # Jump to the patent's position
-                f.seek(patent_positions[patent_id])
-                patent_line = f.readline()
+                # Skip already processed pairs
+                if (citing_pnr, cited_pnr) in processed_pairs:
+                    continue
                 
-                # Parse the CSV line
-                parts = patent_line.split(',')
-                if len(parts) > max(title_idx, abstract_idx):
-                    title = parts[title_idx].strip() if title_idx < len(parts) else ""
-                    
-                    # Handle the case where the abstract might contain commas
-                    if abstract_idx < len(parts):
-                        # This is a simplification - real CSV parsing is more complex
-                        # with quotes and escaped characters
-                        abstract = ','.join(parts[abstract_idx:]).strip()
-                        # Remove quotes if present
-                        if abstract.startswith('"') and abstract.endswith('"'):
-                            abstract = abstract[1:-1]
-                    else:
-                        abstract = ""
-                    
-                    # Preprocess text
-                    token_set = self.preprocess_patent_text(title, abstract)
-                    
-                    # Update cache
-                    self._update_cache(patent_id, token_set)
-                    
-                    return token_set
-        
-        # Patent not found
-        return None
-    
-    def _update_cache(self, patent_id, token_set):
-        """Update the patent cache, removing oldest entries if necessary"""
-        if len(self.patent_cache) >= self.max_cache_size:
-            # Remove a random item from cache
-            # In a more sophisticated implementation, we'd use LRU strategy
-            self.patent_cache.pop(next(iter(self.patent_cache)))
-        
-        self.patent_cache[patent_id] = token_set
-    
-    def calculate_jaccard_similarity(self, set_a, set_b):
-        """Calculate Jaccard similarity between two sets"""
-        if not set_a or not set_b:
-            return 0.0
-            
-        intersection = len(set_a.intersection(set_b))
-        if intersection == 0:
-            return 0.0
-            
-        union = len(set_a.union(set_b))
-        return intersection / union
-    
-    def process_citation_pairs(self, patents_file, citation_file, output_file, num_processes=None):
-        """
-        Process citation pairs and calculate similarity for each pair using streaming approach
-        
-        Args:
-            patents_file: CSV file with pnr,title_en,abstract_en columns
-            citation_file: CSV file with citing_pnr,cited_pnr columns
-            output_file: Output file to write results
-            num_processes: Number of processes to use for parallel processing
-        """
-        print(f"Processing citation pairs from {citation_file}...")
-        start_time = time.time()
-        
-        # Determine number of processes
-        if num_processes is None:
-            num_processes = mp.cpu_count()
-        
-        print(f"Using {num_processes} processes for parallel computation")
-        
-        # Create patent index for fast lookup
-        patent_positions, header_pos = self.create_patent_index(patents_file)
-        
-        # 检查断点续传
-        processed_pairs_set = set()
-        if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-            # 读取已处理的引用对
-            with open(output_file, 'r', encoding='utf-8') as f:
-                next(f)  # 跳过标题行
-                for line in f:
-                    parts = line.strip().split(',')
-                    if len(parts) >= 2:
-                        processed_pairs_set.add((parts[0], parts[1]))
-            
-            print(f"Resuming from {len(processed_pairs_set)} previously processed pairs")
-        
-        # Set up counters
-        total_pairs = 0
-        processed_count = 0
-        successful_pairs = 0
-        missing_patents = set()
-        
-        # Process in chunks for better performance with multiprocessing
-        chunk_size = 10000
-        current_chunk = []
-        
-        # 确定是新建文件还是追加模式
-        write_mode = 'a' if processed_pairs_set else 'w'
-        
-        # Open output file for streaming writes
-        with open(output_file, write_mode, encoding='utf-8') as f_out:
-            # 只有在新建文件时才写入标题
-            if write_mode == 'w':
-                f_out.write("citing_pnr,cited_pnr,similarity\n")
-            
-            # Read citation pairs
-            with open(citation_file, 'r', encoding='utf-8') as f_in:
-                reader = csv.DictReader(f_in)
+                # Add to batch
+                citation_pairs.append((citing_pnr, cited_pnr))
                 
-                for row in reader:
-                    citing_pnr = row['citing_pnr'].strip()
-                    cited_pnr = row['cited_pnr'].strip()
-                    total_pairs += 1
+                # Process batch when it reaches the desired size
+                if len(citation_pairs) >= batch_size:
+                    # Create a process pool with initialized workers
+                    with mp.Pool(
+                        processes=num_processes,
+                        initializer=initialize_worker,
+                        initargs=(patents_file, patent_positions, header_pos, vocabulary)
+                    ) as pool:
+                        # Process batch in parallel
+                        for result in pool.map(process_citation_pair, citation_pairs):
+                            citing_pnr, cited_pnr, similarity, missing = result
+                            
+                            if similarity is not None:
+                                f_out.write(f"{citing_pnr} {cited_pnr} {similarity}\n")
+                                successful_pairs += 1
+                            else:
+                                # Record missing patents
+                                for patent_id in missing:
+                                    f_missing.write(f"{patent_id}\n")
+                                    missing_patents_count += 1
                     
-                    # 检查是否已处理过这对引用
-                    if (citing_pnr, cited_pnr) in processed_pairs_set:
-                        continue
+                    # Clear batch and force garbage collection
+                    citation_pairs = []
+                    gc.collect()
                     
-                    current_chunk.append((citing_pnr, cited_pnr))
-                    
-                    # Process chunk when it reaches the desired size
-                    if len(current_chunk) >= chunk_size:
-                        if num_processes > 1 and len(current_chunk) > 100:
-                            self._process_chunk_parallel(current_chunk, patents_file, patent_positions, 
-                                                        header_pos, f_out, num_processes, missing_patents)
+                    # Print progress
+                    current_time = time.time()
+                    if current_time - last_progress_time >= 5:
+                        elapsed = current_time - start_time
+                        progress = (total_pairs / total_pairs_count) * 100
+                        pairs_per_sec = total_pairs / elapsed if elapsed > 0 else 0
+                        estimated_remaining = (total_pairs_count - total_pairs) / pairs_per_sec if pairs_per_sec > 0 else 0
+                        
+                        print(f"Progress: {total_pairs}/{total_pairs_count} pairs ({progress:.2f}%)")
+                        print(f"Speed: {pairs_per_sec:.1f} pairs/sec, ETA: {estimated_remaining/60:.1f} min")
+                        print(f"Successful: {successful_pairs}, Missing patents: {missing_patents_count}")
+                        print("-" * 70)
+                        
+                        last_progress_time = current_time
+            
+            # Process remaining pairs
+            if citation_pairs:
+                with mp.Pool(
+                    processes=num_processes,
+                    initializer=initialize_worker,
+                    initargs=(patents_file, patent_positions, header_pos, vocabulary)
+                ) as pool:
+                    for result in pool.map(process_citation_pair, citation_pairs):
+                        citing_pnr, cited_pnr, similarity, missing = result
+                        
+                        if similarity is not None:
+                            f_out.write(f"{citing_pnr} {cited_pnr} {similarity}\n")
+                            successful_pairs += 1
                         else:
-                            self._process_chunk_sequential(current_chunk, patents_file, patent_positions, 
-                                                          header_pos, f_out, missing_patents)
-                        
-                        # Update processed pairs count
-                        processed_count += len(current_chunk)
-                        successful_pairs += len(current_chunk) - len(missing_patents)
-                        current_chunk = []
-                        
-                        # Print progress
-                        print(f"Processed {processed_count}/{total_pairs} citation pairs...")
-                
-                # Process any remaining pairs
-                if current_chunk:
-                    if num_processes > 1 and len(current_chunk) > 100:
-                        self._process_chunk_parallel(current_chunk, patents_file, patent_positions, 
-                                                    header_pos, f_out, num_processes, missing_patents)
-                    else:
-                        self._process_chunk_sequential(current_chunk, patents_file, patent_positions, 
-                                                      header_pos, f_out, missing_patents)
-                    
-                    processed_count += len(current_chunk)
-                    successful_pairs += len(current_chunk) - len(missing_patents)
-        
-        elapsed = time.time() - start_time
-        print(f"Completed processing {total_pairs} citation pairs in {elapsed:.2f} seconds.")
-        print(f"Successfully calculated similarity for {successful_pairs} pairs.")
-        print(f"Number of missing patents: {len(missing_patents)}")
-        
-        # Write list of missing patents to file for reference
-        if missing_patents:
-            missing_file = f"{os.path.splitext(output_file)[0]}_missing_patents.txt"
-            with open(missing_file, 'w', encoding='utf-8') as f:
-                for pnr in sorted(missing_patents):
-                    f.write(f"{pnr}\n")
-            print(f"List of missing patents written to {missing_file}")
-
-    def _process_chunk_sequential(self, chunk, patents_file, patent_positions, header_pos, output_file, missing_patents):
-        """Process a chunk of citation pairs sequentially"""
-        for citing_pnr, cited_pnr in chunk:
-            # Get patent data
-            citing_tokens = self.get_patent_data(citing_pnr, patents_file, patent_positions, header_pos)
-            cited_tokens = self.get_patent_data(cited_pnr, patents_file, patent_positions, header_pos)
-            
-            # Calculate similarity if both patents exist
-            if citing_tokens and cited_tokens:
-                similarity = self.calculate_jaccard_similarity(citing_tokens, cited_tokens)
-                output_file.write(f"{citing_pnr},{cited_pnr},{similarity:.6f}\n")
-            else:
-                # Record missing patents
-                if not citing_tokens:
-                    missing_patents.add(citing_pnr)
-                if not cited_tokens:
-                    missing_patents.add(cited_pnr)
+                            # Record missing patents
+                            for patent_id in missing:
+                                f_missing.write(f"{patent_id}\n")
+                                missing_patents_count += 1
     
-    def _process_single_pair(self, pair_data):
-        """
-        Process a single citation pair, used by the parallel processor
-        
-        Args:
-            pair_data: Tuple of (citing_pnr, cited_pnr, patents_file, patent_positions, header_pos)
-            
-        Returns:
-            Tuple of (citing_pnr, cited_pnr, similarity) or None if a patent is missing
-        """
-        citing_pnr, cited_pnr, patents_file, patent_positions, header_pos = pair_data
-        
-        # Get patent data
-        citing_tokens = self.get_patent_data(citing_pnr, patents_file, patent_positions, header_pos)
-        cited_tokens = self.get_patent_data(cited_pnr, patents_file, patent_positions, header_pos)
-        
-        # Calculate similarity if both patents exist
-        if citing_tokens and cited_tokens:
-            similarity = self.calculate_jaccard_similarity(citing_tokens, cited_tokens)
-            return (citing_pnr, cited_pnr, similarity)
-        else:
-            # Return information about missing patents
-            missing = []
-            if not citing_tokens:
-                missing.append(citing_pnr)
-            if not cited_tokens:
-                missing.append(cited_pnr)
-            return None, missing
+    # Report results
+    elapsed_time = time.time() - start_time
     
-    def _process_chunk_parallel(self, chunk, patents_file, patent_positions, header_pos, 
-                               output_file, num_processes, missing_patents):
-        """Process a chunk of citation pairs in parallel"""
-        # Prepare data for parallel processing
-        pair_data = [(citing_pnr, cited_pnr, patents_file, patent_positions, header_pos) 
-                      for citing_pnr, cited_pnr in chunk]
-        
-        # Process pairs in parallel
-        pool = mp.Pool(processes=num_processes)
-        results = pool.map(self._process_single_pair, pair_data)
-        pool.close()
-        pool.join()
-        
-        # Write results
-        for result in results:
-            if result[0] is not None:
-                # Valid similarity result
-                citing_pnr, cited_pnr, similarity = result
-                output_file.write(f"{citing_pnr},{cited_pnr},{similarity:.6f}\n")
-            else:
-                # Missing patents
-                for patent_id in result[1]:
-                    missing_patents.add(patent_id)
+    print("\nResults:")
+    print(f"- Total processed citation pairs: {total_pairs}")
+    print(f"- Successfully calculated similarities: {successful_pairs}")
+    print(f"- Missing patents: {missing_patents_count}")
+    print(f"- Results written to: {output_file}")
+    print(f"- Missing patents written to: {missing_patents_file}")
+    print(f"- Total execution time: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Calculate similarity between patent citation pairs using streaming approach')
+    parser = argparse.ArgumentParser(description='Calculate similarity between patent citation pairs with optimized multiprocessing')
     parser.add_argument('--patents', required=True, help='CSV file with patent data (pnr,title_en,abstract_en)')
     parser.add_argument('--citations', required=True, help='CSV file with citation pairs (citing_pnr,cited_pnr)')
-    parser.add_argument('--output', required=True, help='Output file for similarity results')
+    parser.add_argument('--output', required=True, help='Output file for similarity results (TXT format)')
+    parser.add_argument('--dir', required=True, help='Working directory for the pipeline (same as used for main_script.py)')
     parser.add_argument('--processes', type=int, default=None, help='Number of processes to use (default: CPU count)')
-    parser.add_argument('--cache-size', type=int, default=1000, help='Maximum number of patents to keep in cache (default: 1000)')
     args = parser.parse_args()
+    
+    # Define the vocabulary path relative to the main directory
+    vocabulary_path = os.path.join(args.dir, "vocabulary_raw.txt")
+    
+    # If vocabulary not found in the specified directory, try parent directory
+    if not os.path.exists(vocabulary_path):
+        vocabulary_path = os.path.join(args.dir, "../data/vocabulary_raw.txt")
+    
+    # Verify that vocabulary file exists
+    if not os.path.exists(vocabulary_path):
+        print(f"ERROR: Vocabulary file not found in {args.dir} or ../data/")
+        print("Please run main_script.py first to generate the vocabulary.")
+        return
     
     # Create directory for output file if it doesn't exist
     output_dir = os.path.dirname(args.output)
     if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+        ensure_dir_exists(output_dir)
     
-    # Initialize the similarity calculator
-    calculator = StreamingPatentSimilarity()
-    calculator.max_cache_size = args.cache_size
+    # Process citation pairs with shared vocabulary and consistent preprocessing
+    process_citation_pairs(
+        patents_file=args.patents, 
+        citation_file=args.citations, 
+        output_file=args.output, 
+        vocabulary_path=vocabulary_path,
+        num_processes=args.processes
+    )
     
-    # Process citation pairs
-    calculator.process_citation_pairs(args.patents, args.citations, args.output, args.processes)
-    
-    print("Patent citation similarity calculation completed!")
-
 if __name__ == "__main__":
     main()
