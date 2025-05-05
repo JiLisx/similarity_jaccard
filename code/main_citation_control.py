@@ -1,7 +1,8 @@
 """
-Patent Citation Similarity for Patent Control 
+Patent Citation Similarity for Patent Control
 Author: Ji Li 
-Date: May 3, 2025
+Date: May 2025
+
 """
 import os
 import csv
@@ -17,6 +18,7 @@ import uuid
 from Stage01PreprocessData import Stage01PreprocessData
 from Stage02CodifyIdxPatents import Stage02CodifyIdxPatents
 from Stage03IndexPatents import Stage03IndexPatents
+
 
 def ensure_dir_exists(directory):
     """Create directory if it doesn't exist."""
@@ -387,12 +389,13 @@ def get_processed_patents(output_file):
                     parts = line.strip().split()
                     if len(parts) >= 1:
                         cited_pnr = parts[0]
-                        processed.add(cited_pnr)  
+                        processed.add(cited_pnr)
         except Exception as e:
             print(f"Warning: Error reading existing output file: {e}")
             return set()
     
     return processed
+
 
 def calculate_jaccard_similarity(set_a, set_b):
     """Calculate Jaccard similarity between two sets"""
@@ -408,206 +411,64 @@ def calculate_jaccard_similarity(set_a, set_b):
     return round(similarity, 6)
 
 
-def init_worker(main_dir, codified_to_original_arg, original_to_codified_arg, _):
+def init_worker(main_dir, codified_to_original_arg, original_to_codified_arg, shared_data_arg):
     """Initialize worker process with shared data"""
-    global _main_dir, codified_to_original, original_to_codified
+    global _main_dir, codified_to_original, original_to_codified, shared_position_indices, shared_patent_cache, position_index_locks
+    
     _main_dir = main_dir
     codified_to_original = codified_to_original_arg
     original_to_codified = original_to_codified_arg
+    
+    # Unpack the shared data dictionary
+    shared_position_indices, shared_patent_cache, position_index_locks = shared_data_arg
+    
     worker_id = f"worker_{os.getpid()}_{uuid.uuid4().hex[:8]}"
-    print(f"Worker {worker_id} initialized")
+    print(f"Worker {worker_id} initialized with shared memory")
     return worker_id
 
 
-def find_similar_patents_direct_top_n(cited_patents, main_dir, patent_to_year, patent_to_type, 
-                                 original_to_codified, codified_to_original, output_file, 
-                                 top_n=3, num_processes=None, batch_size=1000):
-    """Find similar patents for cited patents with direct Top-N results return"""
-    print(f"Finding top {top_n} similar patents for {len(cited_patents)} cited patents (direct Top-N return)...")
+def get_position_index_from_shared_memory(year, ptype, file_path, cache_file):
+    """Get position index from shared memory, loading from file if needed"""
+    global shared_position_indices, position_index_locks
     
-    # Check year-type files
-    years_types_dir = os.path.join(main_dir, "years_types")
-    if not os.path.exists(years_types_dir):
-        print(f"ERROR: Year-type directory {years_types_dir} not found")
-        return 0
+    key = f"{year}_{ptype}"
     
-    # Create a directory for index caches
-    index_cache_dir = os.path.join(main_dir, "index_cache")
-    if not os.path.exists(index_cache_dir):
-        os.makedirs(index_cache_dir)
+    # If this index is already in shared memory, return it
+    if key in shared_position_indices:
+        return shared_position_indices[key]
     
-    # Get already processed patents to support resuming
-    processed_patents = get_processed_patents(output_file)
-    if processed_patents:
-        print(f"Found {len(processed_patents)} already processed patent-type combinations, will skip these")
-    
-    # Group cited patents by year and type
-    cited_by_year_type = defaultdict(list)
-    
-    for pnr, ptype, pyr in cited_patents:
-        # Skip already processed
-        if (pnr) in processed_patents:
-            continue
-            
-        year = pyr if pyr else patent_to_year.get(pnr, None)
-        if year:
-            key = (year, ptype)
-            cited_by_year_type[key].append((pnr, ptype, year))
-        else:
-            print(f"Warning: No year found for cited patent {pnr}")
-    
-    print(f"Organized {sum(len(v) for v in cited_by_year_type.values())} unprocessed cited patents into {len(cited_by_year_type)} year-type groups")
-    
-    # OPTIMIZATION: Create cache files for position indices
-    needed_files = set()
-    for year, ptype in cited_by_year_type.keys():
-        file_path = os.path.join(years_types_dir, f"patents_{year}_{ptype}.txt")
-        if not os.path.exists(file_path):
-            print(f"Warning: No data file found for year {year}, type {ptype}")
-            continue
-        needed_files.add(file_path)
-    
-    print(f"Creating position index cache files for {len(needed_files)} needed patent files...")
-    
-    # Prepare tasks by breaking down into smaller batches
-    tasks = []
-    
-    for (year, ptype), patents_in_group in cited_by_year_type.items():
-        file_path = os.path.join(years_types_dir, f"patents_{year}_{ptype}.txt")
-        if not os.path.exists(file_path):
-            print(f"Warning: No data file found for year {year}, type {ptype}")
-            continue
+    # Otherwise, we need to load it from file
+    # First acquire the lock for this key to prevent multiple processes 
+    # from trying to load the same index simultaneously
+    if key not in position_index_locks:
+        return {}  # No lock, can't safely proceed
         
-        # Create cache file path
-        cache_file = os.path.join(index_cache_dir, f"patents_{year}_{ptype}.txt.index")
-        
-        # Create index cache if it doesn't exist
-        if not os.path.exists(cache_file) or os.path.getsize(cache_file) == 0:
-            print(f"Creating position index cache for {year}_{ptype}...")
+    with position_index_locks[key]:
+        # Check again after acquiring the lock, as another process may have loaded it
+        if key in shared_position_indices:
+            return shared_position_indices[key]
             
-            # Create the position index - using the codified IDs (base-50)
+        # Load from cache file
+        if os.path.exists(cache_file) and os.path.getsize(cache_file) > 0:
             position_index = {}
-            with open(file_path, 'r', encoding='utf-8') as f:
-                line_count = 0
-                while True:
-                    pos = f.tell()  # Record position before reading
-                    line = f.readline()
-                    if not line:  # End of file
-                        break
-                        
-                    parts = line.strip().split(' ', 2)
-                    if len(parts) >= 1:
-                        patent_id = parts[0]  # Already codified ID (base-50)
-                        position_index[patent_id] = pos
-                    
-                    line_count += 1
-                    if line_count % 1000000 == 0:
-                        print(f"  Processed {line_count} patents for index creation...")
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    parts = line.strip().split(' ', 1)
+                    if len(parts) == 2:
+                        patent_id, pos = parts
+                        position_index[patent_id] = int(pos)
             
-            # Write the position index to a binary file for efficiency
-            # Format: codified_patent_id position
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                for patent_id, pos in position_index.items():
-                    f.write(f"{patent_id} {pos}\n")
+            # Store in shared memory
+            shared_position_indices[key] = position_index
+            print(f"Loaded position index for {key} to shared memory ({len(position_index)} patents)")
+            return position_index
             
-            print(f"Created position index cache with {len(position_index)} patents")
-            # Free memory
-            del position_index
-        else:
-            print(f"Using existing index cache for {year}_{ptype}")
+        # If cache file doesn't exist, create the index
+        print(f"Creating position index for {key}...")
+        position_index = {}
         
-        # Break patents_in_group into smaller batches
-        for i in range(0, len(patents_in_group), batch_size):
-            batch = patents_in_group[i:i+batch_size]
-            # Store the cache file path with the task
-            tasks.append((year, ptype, file_path, batch, top_n, None, cache_file))
-    
-    # Determine number of processes
-    if num_processes is None:
-        num_processes = mp.cpu_count()
-    
-    print(f"Processing {len(tasks)} batches using {num_processes} processes...")
-    
-    # Prepare output file
-    if not os.path.exists(output_file) or len(processed_patents) == 0:
-        with open(output_file, 'w', encoding='utf-8') as f:
-            # Modified header to remove patent_type
-            f.write("cited_pnr control_pnr rank similarity\n")
-        print(f"Created new output file: {output_file}")
-    else:
-        print(f"Appending to existing output file: {output_file}")
-    
-    # Process tasks in parallel
-    total_matches = 0
-    
-    # Start the worker processes
-    with mp.Pool(processes=num_processes, initializer=init_worker, 
-                initargs=(main_dir, codified_to_original, original_to_codified, None)) as pool:
-        # Submit all tasks asynchronously
-        worker_results = []
-        
-        for i, task in enumerate(tasks):
-            # Create a copy of the task with the worker_id
-            worker_id = f"worker_{i % num_processes}"
-            task_with_id = task[:5] + (worker_id,) + task[6:]
-            result = pool.apply_async(process_cited_patent_batch_with_cache, (task_with_id,))
-            worker_results.append(result)
-        
-        # Collect results and write directly to output file
-        with open(output_file, 'a', encoding='utf-8') as f_out:
-            for i, result in enumerate(worker_results):
-                try:
-                    # Get results from worker (only Top-N for each cited patent)
-                    batch_results = result.get()
-                    batch_matches = len(batch_results)
-                    print(f"Batch {i+1}/{len(tasks)} completed: found {batch_matches} matches")
-                    
-                    # Write results directly to output file - without patent_type
-                    for cited_pnr, control_pnr, rank, similarity in batch_results:
-                        f_out.write(f"{cited_pnr} {control_pnr} {rank} {similarity}\n")
-                    
-                    # Update match count
-                    total_matches += batch_matches
-                    
-                except Exception as e:
-                    print(f"Error processing batch {i+1}: {e}")
-    
-    print(f"Position index cache summary:")
-    print(f"- Cache files stored in: {index_cache_dir}")
-    print(f"- Total cache files: {len(needed_files)}")
-    
-    return total_matches
-
-
-def process_cited_patent_batch_with_cache(task_data):
-    """
-    Process a batch of cited patents against patents in a year-type file,
-    using cached position index.
-    """
-    if len(task_data) >= 7:
-        year, patent_type, file_path, cited_patents_batch, top_n, worker_id, cache_file = task_data
-    else:
-        year, patent_type, file_path, cited_patents_batch, top_n, worker_id = task_data
-        # For backward compatibility, if no cache file is provided
-        cache_file = None
-    
-    global codified_to_original, original_to_codified
-    
-    print(f"Worker {worker_id}: Processing {len(cited_patents_batch)} cited patents for {year}_{patent_type}")
-    
-    # Load the position index from cache
-    position_index = {}
-    if cache_file and os.path.exists(cache_file):
-        with open(cache_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                parts = line.strip().split(' ', 1)
-                if len(parts) == 2:
-                    patent_id, pos = parts
-                    position_index[patent_id] = int(pos)
-    else:
-        # Fallback to creating the index if cache is not available
-        print(f"Worker {worker_id}: No cache file found, creating position index...")
         with open(file_path, 'r', encoding='utf-8') as f:
+            line_count = 0
             while True:
                 pos = f.tell()
                 line = f.readline()
@@ -618,15 +479,84 @@ def process_cited_patent_batch_with_cache(task_data):
                 if len(parts) >= 1:
                     patent_id = parts[0]  # Codified ID
                     position_index[patent_id] = pos
+                
+                line_count += 1
+                if line_count % 1000000 == 0:
+                    print(f"  Processed {line_count} patents for index creation...")
+        
+        # Save to cache file
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            for patent_id, pos in position_index.items():
+                f.write(f"{patent_id} {pos}\n")
+        
+        # Store in shared memory
+        shared_position_indices[key] = position_index
+        print(f"Created position index for {key} and added to shared memory ({len(position_index)} patents)")
+        return position_index
+
+
+def get_patent_tokens_from_shared_memory(patent_id, file_path, position_index, local_cache, year_type_key, max_cache_size=10000):
+    """Get patent tokens using shared position index and both local and shared cache"""
+    global shared_patent_cache
     
-    # Initialize patent cache for this worker
-    patent_cache = {}
+    # First check local cache (fastest)
+    if patent_id in local_cache:
+        return local_cache[patent_id]
     
-    # Track statistics
+    # If position is known in the index, read from file
+    if patent_id in position_index:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            f.seek(position_index[patent_id])
+            line = f.readline()
+            parts = line.strip().split(' ', 2)
+            
+            if len(parts) >= 3:
+                # Extract tokens
+                tokens_part = parts[2]
+                token_entries = tokens_part.split(' ')
+                tokens = set()
+                
+                for entry in token_entries:
+                    if ':' in entry:
+                        token, _ = entry.split(':', 1)
+                        tokens.add(token)
+                
+                # Update local cache
+                if len(local_cache) >= max_cache_size:
+                    # Remove least recently used item (first key)
+                    local_cache.pop(next(iter(local_cache)))
+                
+                local_cache[patent_id] = tokens
+                
+                return tokens
+    
+    return None
+
+
+def process_cited_patent_batch_shared(task_data):
+    """Process a batch of cited patents using shared memory for position indices"""
+    year, patent_type, file_path, cited_patents_batch, top_n, cache_file = task_data
+    
+    global codified_to_original, original_to_codified
+    
+    worker_id = f"{os.getpid()}_{uuid.uuid4().hex[:4]}"
+    print(f"Worker {worker_id}: Processing {len(cited_patents_batch)} cited patents for {year}_{patent_type}")
+    
+    # Get position index from shared memory
+    position_index = get_position_index_from_shared_memory(year, patent_type, file_path, cache_file)
+    
+    if not position_index:
+        print(f"Warning: No position index found for {year}_{patent_type}")
+        return []
+    
+    # Local cache for this worker
+    local_patent_cache = {}
+    
     total_processed = 0
     total_matches = 0
     
-    # Results to return directly (only Top-N for each patent)
+    # Results to return (only Top-N for each patent)
     all_results = []
     
     # Process each cited patent in the batch
@@ -641,8 +571,14 @@ def process_cited_patent_batch_with_cache(task_data):
         if cited_pnr in original_to_codified:
             cited_id_codified = original_to_codified[cited_pnr]
             
-            # Get cited patent tokens using position index
-            cited_tokens = get_patent_tokens_with_index(cited_id_codified, file_path, position_index, patent_cache)
+            # Get cited patent tokens using shared position index
+            cited_tokens = get_patent_tokens_from_shared_memory(
+                cited_id_codified, 
+                file_path, 
+                position_index, 
+                local_patent_cache,
+                f"{year}_{patent_type}"
+            )
             
             if cited_tokens:
                 # Store similarities in a min-heap for top-n selection
@@ -655,7 +591,13 @@ def process_cited_patent_batch_with_cache(task_data):
                         continue
                     
                     # Get comparison patent tokens
-                    patent_tokens = get_patent_tokens_with_index(patent_id, file_path, position_index, patent_cache)
+                    patent_tokens = get_patent_tokens_from_shared_memory(
+                        patent_id, 
+                        file_path, 
+                        position_index, 
+                        local_patent_cache,
+                        f"{year}_{patent_type}"
+                    )
                     
                     if patent_tokens:
                         # Calculate similarity
@@ -690,54 +632,194 @@ def process_cited_patent_batch_with_cache(task_data):
             print(f"Worker {worker_id}: Processed {total_processed}/{len(cited_patents_batch)} patents, found {total_matches} matches")
     
     # Clean up memory
-    del patent_cache
-    del position_index
+    del local_patent_cache
     gc.collect()
     
     # Return only the top-N results list
     return all_results
 
 
-def get_patent_tokens_with_index(patent_id, file_path, position_index, patent_cache, max_cache_size=10000):
-    """
-    Get patent tokens from file using position index and caching.
-    Uses the provided position index instead of creating a new one.
-    """
-    # Check cache first
-    if patent_id in patent_cache:
-        return patent_cache[patent_id]
+def setup_shared_memory():
+    """Create shared memory objects for inter-process communication"""
+    # Create a manager for shared objects
+    manager = mp.Manager()
     
-    # If position is known in the index, read from file
-    if patent_id in position_index:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            f.seek(position_index[patent_id])
-            line = f.readline()
-            parts = line.strip().split(' ', 2)
+    # Create shared dictionaries
+    shared_position_indices = manager.dict()
+    shared_patent_cache = manager.dict()
+    
+    # Create locks for position indices
+    position_index_locks = {}
+    
+    return (shared_position_indices, shared_patent_cache, position_index_locks)
+
+
+def preload_position_indices(needed_files, shared_position_indices, position_index_locks):
+    """Preload position indices into shared memory"""
+    print(f"Preloading position indices for {len(needed_files)} patent files...")
+    
+    for year, ptype, file_path, cache_file in needed_files:
+        # Create a lock for this index
+        key = f"{year}_{ptype}"
+        position_index_locks[key] = mp.Lock()
+        
+        # Check if cache file exists
+        if os.path.exists(cache_file) and os.path.getsize(cache_file) > 0:
+            # Load from cache file
+            position_index = {}
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    parts = line.strip().split(' ', 1)
+                    if len(parts) == 2:
+                        patent_id, pos = parts
+                        position_index[patent_id] = int(pos)
             
-            if len(parts) >= 3:
-                # Extract tokens
-                tokens_part = parts[2]
-                token_entries = tokens_part.split(' ')
-                tokens = set()
-                
-                for entry in token_entries:
-                    if ':' in entry:
-                        token, _ = entry.split(':', 1)
-                        tokens.add(token)
-                
-                # Update cache, maintaining maximum size
-                if len(patent_cache) >= max_cache_size:
-                    # Remove least recently used item (first key)
-                    patent_cache.pop(next(iter(patent_cache)))
-                
-                patent_cache[patent_id] = tokens
-                return tokens
+            # Store in shared memory
+            shared_position_indices[key] = position_index
+            print(f"Preloaded position index for {key} ({len(position_index)} patents)")
+        else:
+            # Create the index
+            print(f"Creating position index for {key}...")
+            position_index = {}
+            
+            with open(file_path, 'r', encoding='utf-8') as f:
+                line_count = 0
+                while True:
+                    pos = f.tell()
+                    line = f.readline()
+                    if not line:
+                        break
+                        
+                    parts = line.strip().split(' ', 2)
+                    if len(parts) >= 1:
+                        patent_id = parts[0]  # Codified ID
+                        position_index[patent_id] = pos
+                    
+                    line_count += 1
+                    if line_count % 1000000 == 0:
+                        print(f"  Processed {line_count} patents for index creation...")
+            
+            # Save to cache file
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                for patent_id, pos in position_index.items():
+                    f.write(f"{patent_id} {pos}\n")
+            
+            # Store in shared memory
+            shared_position_indices[key] = position_index
+            print(f"Created position index for {key} ({len(position_index)} patents)")
+
+
+def find_similar_patents_direct_top_n(cited_patents, main_dir, patent_to_year, patent_to_type, 
+                                 original_to_codified, codified_to_original, output_file, 
+                                 top_n=3, num_processes=None, batch_size=1000):
+    """Find similar patents for cited patents with direct Top-N results return using shared memory"""
+    print(f"Finding top {top_n} similar patents for {len(cited_patents)} cited patents (optimized version)...")
     
-    return None
+    # Check year-type files
+    years_types_dir = os.path.join(main_dir, "years_types")
+    if not os.path.exists(years_types_dir):
+        print(f"ERROR: Year-type directory {years_types_dir} not found")
+        return 0
+    
+    # Create a directory for index caches
+    index_cache_dir = os.path.join(main_dir, "index_cache")
+    if not os.path.exists(index_cache_dir):
+        os.makedirs(index_cache_dir)
+    
+    # Get already processed patents to support resuming
+    processed_patents = get_processed_patents(output_file)
+    if processed_patents:
+        print(f"Found {len(processed_patents)} already processed cited patents, will skip these")
+    
+    # Group cited patents by year and type
+    cited_by_year_type = defaultdict(list)
+    
+    for pnr, ptype, pyr in cited_patents:
+        # Skip already processed
+        if pnr in processed_patents:
+            continue
+            
+        year = pyr if pyr else patent_to_year.get(pnr, None)
+        if year:
+            key = (year, ptype)
+            cited_by_year_type[key].append((pnr, ptype, year))
+        else:
+            print(f"Warning: No year found for cited patent {pnr}")
+    
+    print(f"Organized {sum(len(v) for v in cited_by_year_type.values())} unprocessed cited patents into {len(cited_by_year_type)} year-type groups")
+    
+    # Identify needed files
+    needed_files = []
+    for year, ptype in cited_by_year_type.keys():
+        file_path = os.path.join(years_types_dir, f"patents_{year}_{ptype}.txt")
+        cache_file = os.path.join(index_cache_dir, f"patents_{year}_{ptype}.txt.index")
+        
+        if not os.path.exists(file_path):
+            print(f"Warning: No data file found for year {year}, type {ptype}")
+            continue
+            
+        needed_files.append((year, ptype, file_path, cache_file))
+    
+    # Setup shared memory
+    shared_memory_objects = setup_shared_memory()
+    shared_position_indices, shared_patent_cache, position_index_locks = shared_memory_objects
+    
+    # Preload indices into shared memory - this is a key optimization
+    preload_position_indices(needed_files, shared_position_indices, position_index_locks)
+    
+    # Create tasks by breaking down into smaller batches
+    tasks = []
+    
+    for year, ptype, file_path, cache_file in needed_files:
+        # Get patents for this year/type
+        patents_in_group = cited_by_year_type.get((year, ptype), [])
+        
+        # Break patents_in_group into smaller batches
+        for i in range(0, len(patents_in_group), batch_size):
+            batch = patents_in_group[i:i+batch_size]
+            tasks.append((year, ptype, file_path, batch, top_n, cache_file))
+    
+    # Determine number of processes
+    if num_processes is None:
+        num_processes = min(mp.cpu_count(), 30)  # Limit to a reasonable number
+    
+    print(f"Processing {len(tasks)} batches using {num_processes} processes with shared memory...")
+    
+    # Prepare output file
+    if not os.path.exists(output_file) or len(processed_patents) == 0:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write("cited_pnr control_pnr rank similarity\n")
+        print(f"Created new output file: {output_file}")
+    else:
+        print(f"Appending to existing output file: {output_file}")
+    
+    # Process tasks in parallel
+    total_matches = 0
+    
+    # Start worker processes
+    with mp.Pool(processes=num_processes, initializer=init_worker, 
+                initargs=(main_dir, codified_to_original, original_to_codified, shared_memory_objects)) as pool:
+        
+        with open(output_file, 'a', encoding='utf-8') as f_out:
+            for i, batch_results in enumerate(
+                    pool.imap_unordered(process_cited_patent_batch_shared, tasks), 1):
+                
+                batch_matches = len(batch_results)
+                print(f"Batch {i}/{len(tasks)} completed: found {batch_matches} matches")
+                
+                for cited_pnr, control_pnr, rank, similarity in batch_results:
+                    f_out.write(f"{cited_pnr} {control_pnr} {rank} {similarity}\n")
+                
+                total_matches += batch_matches
+    
+    print(f"Total matches found: {total_matches}")
+    return total_matches
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Patent Citation Similarity Pipeline (Direct Top-N)')
+    """Main entry point of the program"""
+    parser = argparse.ArgumentParser(description='Patent Citation Similarity Pipeline (Optimized Version)')
     parser.add_argument('--patents', required=True, help='CSV file with patent data')
     parser.add_argument('--citations', required=True, help='CSV file with citation data')
     parser.add_argument('--dir', required=True, help='Working directory for intermediate files')
@@ -781,7 +863,7 @@ def main():
         print("Failed to load cited patents. Exiting.")
         return
     
-    # Find similar patents with direct Top-N results
+    # Find similar patents with direct Top-N results (using shared memory)
     total_matches = find_similar_patents_direct_top_n(
         cited_patents,
         args.dir,
