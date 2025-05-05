@@ -1,6 +1,6 @@
 """
-Patent Citation Pair Similarity - Optimized for Large Datasets with Enhanced Multiprocessing
-Author: Ji Li (Modified)
+Patent Citation Pair Similarity
+Author: Ji Li
 Date: May 3, 2025
 """
 
