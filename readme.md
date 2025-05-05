@@ -1,185 +1,106 @@
 # Patent Similarity Analysis
 
-This is an enhanced version of the patent similarity analysis system with multiprocessing support for significantly improved performance on multi-core systems.
+This repository contains a set of Python scripts for analyzing patent similarity using text matching techniques.
 
-This codebase includes a Java-to-Python translation of the implementation referenced in Arts, S., Cassiman, B., & Gomez, J.C. (2017), along with additional functional improvements.
+This implementation is based on:
+Arts, S., Cassiman, B., & Gomez, J. C. (2017). Text matching to measure patent similarity. Strategic Management Journal.
 
-## Overview
+## Scripts Overview
 
-The system processes patent data through several stages:
-1. **Preprocessing Data**: Transforms raw patent data into a bag-of-words format
-2. **Codifying Indices**: Creates space-efficient base-50 encodings for patents and vocabulary 
-3. **Indexing Patents**: Indexes patents using codified numbers and vocabulary
-4. **Splitting Data by Year**: Organizes patent data by publication year
-5. **Computing Similarity**: Calculates Jaccard similarity between patents 
+### Main Scripts
 
-## Requirements
+- **main_script.py**: Main pipeline for patent similarity analysis by filing year. Executes all stages from preprocessing to similarity calculation.
+- **main_citation_control.py**: Finds similar patents for citation control using multipra zocessing.
+- **main_citation_pair.py**: Calculates similarity between patent citation pairs.
 
-- Python 3.6 or higher
-- Input data in CSV format with patent number, year, title, and abstract
-* Patents_raw.csv* is a raw comma separated value file containing one row for each patent in the following format: 
-```[Patent Number],[Filing Year],[Title],[Abstract] ```
-As an example of the format, we show a patent in the file:  
-3631874,1970,FLUIDIC OVERSPEED SENSOR FOR A POWER TURBINE,A fluidic sensor 
-having two parallel frequency-to-analog circuits whose output is summed to provide an error 
-signal is disclosed.
+### Pipeline Stages
 
-## Usage
+- **Stage01PreprocessData.py**: Preprocesses patent data from CSV format into a bag-of-words representation.
+- **Stage02CodifyIdxPatents.py**: Converts patent numbers and vocabulary words into a space-efficient base-50 encoding.
+- **Stage03IndexPatents.py**: Indexes patents using codified numbers and vocabulary to save disk/memory space.
+- **Stage04SplitDataPerYear.py**: Splits indexed patent data by year for more efficient processing.
+- **Stage05ComputeSimilarity.py**: Computes pairwise Jaccard similarity between patents with multiprocessing.
 
-### Running the Complete Pipeline
+### Supporting Files
 
-```bash
-python main_script.py --dir /path/to/your/data --start 2001 --end 2003 --processes 8
-```
+- **StopWords.py**: Base class for stopword management.
+- **EnglishStopWords.py**: English stopwords implementation for filtering common words.
 
-### Arguments
+## Usage Examples
 
-- `--dir`: Working directory for data files (required)
-- `--start`: Start year for similarity calculation (default: 2001)
-- `--end`: End year for similarity calculation (default: 2003)
-- `--stage`: Start from specific stage (1-5, 0 for all stages)
-- `--processes`: Number of processes to use (default: all available cores)
-- `--sequential`: Use sequential processing instead of multiprocessing
+### 1. Main Pipeline
 
-
-### Running Only the Similarity Calculation Stage
+To run the full patent similarity pipeline:
 
 ```bash
-python Stage05ComputeSimilarity.py --dir /path/to/your/data --start 2001 --end 2003 --processes 8
+python main_script.py --dir /path/to/workdir --start 1985 --end 2024 --processes 4
 ```
 
-### Running from a Specific Stage
+Options:
+- `--dir`: Working directory for data files
+- `--start`: Start year for similarity calculation
+- `--end`: End year for similarity calculation
+- `--processes`: Number of processes to use
+- `--top`: Only keep top N most similar patent pairs per year
+- `--stage`: Start from specific stage (1-5, 0 for all)
+
+### 2. Citation Control
+
+To find similar patents for citation control:
 
 ```bash
-python main_script.py --dir /path/to/your/data --stage 3 --processes 6
+python main_citation_control.py --patents patents.csv --citations citations.csv --dir /path/to/workdir --output results.txt
 ```
 
+Options:
+- `--patents`: CSV file with patent data
+- `--citations`: CSV file with citation data
+- `--dir`: Working directory
+- `--output`: Output file for results
+- `--processes`: Number of processes
+- `--top`: Number of top similar patents to find
+- `--batch`: Number of patents per batch
+- `--skip-preprocess`: Skip preprocessing stages
 
+### 3. Citation Pair Similarity
 
-# Patent Similarity Analysis: `main_closest.py`
-
-This script is a utility for analyzing patent similarity data using multiprocessing capabilities. It enables researchers to find the closest matching patents, create case-control groups, and analyze similarity patterns across large patent datasets.
-
-## Requirements
-
-- Python 3.6+
-- pandas
-- Similarity files generated by the patent similarity pipeline (Stage05ComputeSimilarity)
-
-## Usage
+To calculate similarity between citation pairs:
 
 ```bash
-python main_closest.py --jaccard_dir <similarity_files_dir> --output_dir <results_dir> [OPTIONS]
+python main_citation_pair.py --patents patents.csv --citations citations.csv --dir /path/to/workdir --output similarity_results.txt
 ```
 
-### Required Arguments
+Options:
+- `--patents`: CSV file with patent data
+- `--citations`: CSV file with citation pairs
+- `--output`: Output file for similarity results
+- `--dir`: Working directory
+- `--processes`: Number of processes to use
 
-- `--jaccard_dir`: Directory containing the Jaccard similarity files
-- `--output_dir`: Directory where results will be saved
+## Required Data Formats
 
-### Optional Arguments
+### Patent Data CSV Format
+The main patent data file should be a CSV with the following columns:
+- `pnr`: Patent number (unique identifier)
+- `year`: Publication year
+- `title_en` or column at index 2: Patent title
+- `abstract_en` or column at index 3: Patent abstract
 
-- `--action`: Analysis operation to perform (default: "analyze")
-  - `analyze`: Generate statistical analysis of similarity data
-  - `closest`: Find closest matching patents
-  - `case_control`: Create case-control groups for target patents
-- `--start_year`: Starting year for analysis (default: 2001)
-- `--end_year`: Ending year for analysis (default: 2003)
-- `--processes`: Number of parallel processes to use (default: all available CPU cores)
-- `--min_similarity`: Minimum similarity threshold (default: 0.05)
-- `--top_n`: Number of closest matches to find per patent (default: 1)
-- `--target_patents`: File containing target patents (required for case_control action)
+Example:
+```
+pnr,year,title_en,abstract_en
+CN101,2015,Machine learning algorithm,Advanced machine learning algorithm for pattern recognition with neural network implementation.,,
+CN102,2015,Deep learning framework,Deep learning framework enabling computational efficiency for large scale data processing tasks.,,
 
-## Operation Modes
-
-### 1. Analyze Mode
-
-Performs statistical analysis of patent similarity data and generates summary reports.
-
-```bash
-python main_closest.py --action analyze --jaccard_dir ./similarity --output_dir ./results
 ```
 
-**Output**: 
-- `similarity_stats.csv`: Summary statistics for each year
-- Console output with aggregate statistics
+### Citation Data CSV Format
+Citation data should be a CSV with the following columns:
+- For main_citation_control.py:
+  - `cited_pnr`: Cited patent number
+  - `cited_patent_type`: Type of cited patent (pnra, pnrbc or utility) (pnra refers to application patents, pnrbc refers to grant inventions, utility refers to ulitily inventions)
+  - `year` (optional): Filing year of cited patent
 
-### 2. Closest Mode
-
-Finds the most similar patents for each patent in the dataset.
-
-```bash
-python main_closest.py --action closest --jaccard_dir ./similarity --output_dir ./results --top_n 5
-```
-
-**Output**: 
-- `closest_match_{year}.csv`: Files containing each patent and its top N matches
-- Format: "Patent,MatchingPatent,JaccardIndex"
-
-### 3. Case-Control Mode
-
-Creates matched control groups for a specified set of target patents.
-
-```bash
-python main_closest.py --action case_control --jaccard_dir ./similarity --output_dir ./results --target_patents ./targets.txt
-```
-
-**Output**:
-- `case_control_pairs.csv`: Mapping of target patents to their control matches
-- Format: "TargetPatent,ControlPatent,JaccardIndex"
-
-## Input File Formats
-
-### Similarity Files
-
-The tool expects Jaccard similarity files in the format:
-```
-patent1 patent2 similarity_score
-```
-
-### Target Patents File
-
-For case-control analysis, provide a file with one patent number per line:
-```
-CN9123456
-CN8765432
-...
-```
-
-## Advanced Examples
-
-### Finding Top 10 Most Similar Patents with Higher Threshold
-
-```bash
-python main_closest.py --action closest --jaccard_dir ./data --output_dir ./results --top_n 10 --min_similarity 0.15 --processes 16
-```
-
-### Creating Multiple Controls per Target Patent
-
-```bash
-python main_closest.py --action case_control --jaccard_dir ./data --output_dir ./results --target_patents ./biotech_patents.txt --top_n 3 --processes 8
-```
-
-### Analyzing a Specific Time Period with Custom Process Count
-
-```bash
-python main_closest.py --action analyze --jaccard_dir ./data --output_dir ./results --start_year 2010 --end_year 2015 --processes 4
-```
-
-## Performance Considerations
-
-- For very large datasets, increase the chunk size by modifying the `lines_to_read` variable
-- The optimal number of processes depends on your CPU and available memory
-- For systems with limited memory, using fewer processes may be more efficient
-
-## Example Command Line
-
-```bash
-python3 ./code/main_script.py --dir ./data/ --start 1985 --end 2025
-
-python3 ./code/main_closest.py --action closest --jaccard_dir ./data/jaccard/ --output_dir ./results --processes 2 --start_year 2001 --end_year 2020 --top_n 10 --min_similarity 0.00
-```
-
-## License
-
-This script is provided for research purposes only.
+- For main_citation_pair.py:
+  - `citing_pnr`: Citing patent publication number
+  - `cited_pnr`: Cited patent publication number
