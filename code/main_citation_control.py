@@ -332,43 +332,60 @@ def create_patent_type_index(patents_file, main_dir):
 def load_cited_patents(citations_file):
     """Load cited patents from the citations file"""
     print(f"Loading cited patents from {citations_file}...")
-    cited_patents = []
+    cited_patents_set = set()
     
     with open(citations_file, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        header = reader.fieldnames
+        header_line = f.readline().strip()
+        header = header_line.split(',')
         
         # Check for required columns
-        if 'cited_pnr' not in header and 'cited_patent' not in header:
-            print("ERROR: Required 'cited_pnr' or 'cited_patent' column not found in citations file")
+        if 'cited_pnr' not in header and 'citing_pnr' not in header:
+            print("ERROR: Required 'cited_pnr' or 'citing_pnr' column not found in citations file")
             return None
         
-        if 'cited_patent_type' not in header and 'cited_type' not in header:
+        if 'cited_patent_type' not in header and 'citing_patent_type' not in header:
             print("ERROR: Required type column not found in citations file")
-            print("Citations CSV must include a 'cited_patent_type' or 'cited_type' column")
+            print("Citations CSV must include a 'cited_patent_type' or 'citing_patent_type' column")
             return None
         
         # Determine column names
         cited_pnr_col = 'cited_pnr' if 'cited_pnr' in header else 'cited_patent'
         cited_type_col = 'cited_patent_type' if 'cited_patent_type' in header else 'cited_type'
+        cited_pnr_idx = header.index(cited_pnr_col)
+        cited_type_idx = header.index(cited_type_col)
         
         # Look for year column
         year_col = None
+        year_idx = -1
         for possible_name in ['cited_year', 'year']:
             if possible_name in header:
                 year_col = possible_name
+                year_idx = header.index(year_col)
                 break
+        count = 0
         
-        for row in reader:
-            cited_pnr = row.get(cited_pnr_col, '').strip()
-            cited_type = row.get(cited_type_col, '').strip().lower()
-            cited_year = row.get(year_col, '').strip() if year_col else ''
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+                
+            parts = line.split(',')
+            if len(parts) <= max(cited_pnr_idx, cited_type_idx):
+                continue
+                
+            cited_pnr = parts[cited_pnr_idx].strip()
+            cited_type = parts[cited_type_idx].strip().lower()
+            cited_year = parts[year_idx].strip() if year_idx >= 0 and year_idx < len(parts) else ''
             
             if cited_pnr and cited_type:
                 cited_tuple = (cited_pnr, cited_type, cited_year)
-                if cited_tuple not in cited_patents:
-                    cited_patents.append(cited_tuple)
+                cited_patents_set.add(cited_tuple)
+            
+            count += 1
+            if count % 500000 == 0:
+                print(f"  Processed {count} citations, found {len(cited_patents_set)} unique patents so far...")
     
+    cited_patents = list(cited_patents_set)
     print(f"Loaded {len(cited_patents)} unique cited patents")
     return cited_patents
 
